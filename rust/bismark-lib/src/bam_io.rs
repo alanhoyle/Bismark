@@ -1,7 +1,7 @@
+use anyhow::{bail, Context, Result};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use anyhow::{bail, Context, Result};
 
 /// Read SAM/BAM via `samtools view -h`.
 pub struct BamReader {
@@ -24,7 +24,10 @@ impl BamReader {
             .spawn()
             .with_context(|| format!("failed to spawn samtools for {}", path.display()))?;
         let stdout = child.stdout.take().unwrap();
-        Ok(BamReader { child, reader: BufReader::with_capacity(1 << 20, stdout) })
+        Ok(BamReader {
+            child,
+            reader: BufReader::with_capacity(1 << 20, stdout),
+        })
     }
 
     pub fn lines(&mut self) -> &mut BufReader<ChildStdout> {
@@ -49,8 +52,14 @@ pub struct BamWriter {
 
 impl BamWriter {
     pub fn open(samtools: &str, path: &Path) -> Result<Self> {
+        Self::open_with_threads(samtools, path, 1)
+    }
+
+    pub fn open_with_threads(samtools: &str, path: &Path, threads: u32) -> Result<Self> {
         let mut child = Command::new(samtools)
-            .args(["view", "-bS", "-"])
+            .args(["view", "-bS", "--threads"])
+            .arg(threads.to_string())
+            .arg("-")
             .arg("-o")
             .arg(path)
             .stdin(Stdio::piped())
@@ -58,7 +67,10 @@ impl BamWriter {
             .spawn()
             .with_context(|| format!("failed to spawn samtools for {}", path.display()))?;
         let stdin = child.stdin.take().unwrap();
-        Ok(BamWriter { child, writer: BufWriter::with_capacity(1 << 20, stdin) })
+        Ok(BamWriter {
+            child,
+            writer: BufWriter::with_capacity(1 << 20, stdin),
+        })
     }
 
     pub fn write_line(&mut self, line: &[u8]) -> Result<()> {

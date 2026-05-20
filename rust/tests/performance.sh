@@ -351,12 +351,12 @@ bench_dedup() {
     local t
     t="$(time_command "$wd/logs/dedup_perl_$run" \
         perl "$PERL_BIN/deduplicate_bismark" \
-        --single --output_dir "$perl_dir" "$perl_dir/large.bam")"
+        --single --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/large.bam")"
     append_result "deduplicate_bismark" "perl" "$run" "$t"
 
     t="$(time_command "$wd/logs/dedup_rust_$run" \
         "$RUST_BIN/deduplicate_bismark" \
-        --single --output_dir "$rust_dir" "$rust_dir/large.bam")"
+        --single --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/large.bam")"
     append_result "deduplicate_bismark" "rust" "$run" "$t"
 }
 
@@ -371,12 +371,12 @@ bench_test_files_dedup() {
     local t
     t="$(time_command "$wd/logs/test_files_dedup_perl_$run" \
         perl "$PERL_BIN/deduplicate_bismark" \
-        --paired --output_dir "$perl_dir" "$perl_dir/test.bam")"
+        --paired --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/test.bam")"
     append_result "test_files/deduplicate_bismark" "perl" "$run" "$t"
 
     t="$(time_command "$wd/logs/test_files_dedup_rust_$run" \
         "$RUST_BIN/deduplicate_bismark" \
-        --paired --output_dir "$rust_dir" "$rust_dir/test.bam")"
+        --paired --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/test.bam")"
     append_result "test_files/deduplicate_bismark" "rust" "$run" "$t"
 }
 

@@ -469,11 +469,11 @@ test_dedup() {
 
     # Perl
     perl "$PERL_BIN/deduplicate_bismark" \
-        --single --output_dir "$perl_dir" "$perl_dir/test.bam" 2>/dev/null
+        --single --parallel 2 --output_dir "$perl_dir" "$perl_dir/test.bam" 2>/dev/null
 
     # Rust
     "$RUST_BIN/deduplicate_bismark" \
-        --single --output_dir "$rust_dir" "$rust_dir/test.bam" 2>/dev/null
+        --single --parallel 2 --output_dir "$rust_dir" "$rust_dir/test.bam" 2>/dev/null
 
     local perl_rep rust_rep
     perl_rep=$(ls "$perl_dir/"*deduplication_report* 2>/dev/null | head -1)
@@ -674,9 +674,9 @@ test_test_files_inputs() {
     cp "$bam" "$perl_dir/test.bam"
     cp "$bam" "$rust_dir/test.bam"
     perl "$PERL_BIN/deduplicate_bismark" \
-        --paired --output_dir "$perl_dir" "$perl_dir/test.bam" 2>/dev/null
+        --paired --parallel 2 --output_dir "$perl_dir" "$perl_dir/test.bam" 2>/dev/null
     "$RUST_BIN/deduplicate_bismark" \
-        --paired --output_dir "$rust_dir" "$rust_dir/test.bam" 2>/dev/null
+        --paired --parallel 2 --output_dir "$rust_dir" "$rust_dir/test.bam" 2>/dev/null
     local perl_rep rust_rep perl_bam rust_bam
     perl_rep=$(find_one "$perl_dir" "*deduplication_report*")
     rust_rep=$(find_one "$rust_dir" "*deduplication_report*")

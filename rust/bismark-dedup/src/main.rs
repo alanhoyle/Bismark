@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long)]
     samtools_path: Option<String>,
 
+    /// Number of threads to pass to samtools view
+    #[arg(long = "parallel", default_value_t = 1)]
+    parallel: u32,
+
     /// Print version and exit
     #[arg(long = "version")]
     version: bool,
@@ -77,6 +81,9 @@ fn main() -> Result<()> {
     if cli.single && cli.paired {
         bail!("Please select either -s (single-end) or -p (paired-end), not both!");
     }
+    if cli.parallel == 0 {
+        bail!("Core usage needs to be set to 1 or more");
+    }
 
     let samtools = find_samtools(cli.samtools_path.as_deref())?;
     let output_dir = normalise_dir(&cli.output_dir);
@@ -86,7 +93,14 @@ fn main() -> Result<()> {
     } else {
         if cli.multiple {
             eprintln!("Multiple Input files for the same sample selected - All input files are treated as one big single file. The files to be used are:");
-            eprintln!("{}\n\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n", cli.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n"));
+            eprintln!(
+                "{}\n\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n",
+                cli.files
+                    .iter()
+                    .map(|f| f.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
         }
         eprintln!("\nIf there are several alignments to a single position in the genome the first alignment will be chosen. Since the input files are not in any way sorted this is a near-enough random selection of reads.\n");
     }
@@ -94,13 +108,33 @@ fn main() -> Result<()> {
     if cli.multiple {
         // Treat all files as one combined input
         if !cli.files.is_empty() {
-            deduplicate_files(&cli.files, cli.single, cli.paired, cli.rrbs, cli.bclconvert,
-                              true, &output_dir, cli.outfile.as_deref(), &samtools)?;
+            deduplicate_files(
+                &cli.files,
+                cli.single,
+                cli.paired,
+                cli.rrbs,
+                cli.bclconvert,
+                true,
+                &output_dir,
+                cli.outfile.as_deref(),
+                &samtools,
+                cli.parallel,
+            )?;
         }
     } else {
         for file in &cli.files {
-            deduplicate_files(&[file.clone()], cli.single, cli.paired, cli.rrbs, cli.bclconvert,
-                              false, &output_dir, cli.outfile.as_deref(), &samtools)?;
+            deduplicate_files(
+                &[file.clone()],
+                cli.single,
+                cli.paired,
+                cli.rrbs,
+                cli.bclconvert,
+                false,
+                &output_dir,
+                cli.outfile.as_deref(),
+                &samtools,
+                cli.parallel,
+            )?;
         }
     }
 
@@ -117,6 +151,7 @@ fn deduplicate_files(
     output_dir: &str,
     user_outfile: Option<&str>,
     samtools: &str,
+    parallel: u32,
 ) -> Result<()> {
     let primary = &files[0];
 
@@ -152,7 +187,11 @@ fn deduplicate_files(
         .with_context(|| format!("failed to create {report_path}"))?;
 
     // Derive output BAM filename
-    let out_stem = if let Some(u) = user_outfile { base_stem(u) } else { derive_stem(primary, None) };
+    let out_stem = if let Some(u) = user_outfile {
+        base_stem(u)
+    } else {
+        derive_stem(primary, None)
+    };
     let out_name = if multiple {
         format!("{out_stem}.multiple.deduplicated.bam")
     } else {
@@ -164,16 +203,18 @@ fn deduplicate_files(
     // Read header for output BAM
     let header = get_sam_header(samtools, primary)?;
 
-    let mut out_bam = BamWriter::open(samtools, &out_path)?;
+    let mut out_bam = BamWriter::open_with_threads(samtools, &out_path, parallel)?;
     for line in header.lines() {
-        if !line.is_empty() { out_bam.write_line(line.as_bytes())?; }
+        if !line.is_empty() {
+            out_bam.write_line(line.as_bytes())?;
+        }
     }
 
     // Build chromosome → u32 intern table from header
     let chr_map = build_chr_map(&header);
 
     // Open input
-    let mut reader = open_input(samtools, files, multiple)?;
+    let mut reader = open_input(samtools, files, multiple, parallel)?;
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
 
     let mut unique_seqs_se: FxHashSet<SeKey> = FxHashSet::default();
@@ -187,11 +228,19 @@ fn deduplicate_files(
     loop {
         buf.clear();
         let n = reader.lines().read_until(b'\n', &mut buf)?;
-        if n == 0 { break; }
-        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') { buf.pop(); }
+        if n == 0 {
+            break;
+        }
+        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
 
-        if buf.starts_with(b"@") { continue; } // headers already written
-        if buf.is_empty() { continue; }
+        if buf.starts_with(b"@") {
+            continue;
+        } // headers already written
+        if buf.is_empty() {
+            continue;
+        }
 
         count += 1;
         let r1 = buf.clone();
@@ -214,7 +263,11 @@ fn deduplicate_files(
         if is_single {
             // SE dedup key: (strand, chr, position)
             // Forward reads use start; reverse reads use end (= POS + ref_span - 1)
-            let key_pos = if forward { pos } else { pos.saturating_sub(1) + cigar_ref_span(cigar_r1) };
+            let key_pos = if forward {
+                pos
+            } else {
+                pos.saturating_sub(1) + cigar_ref_span(cigar_r1)
+            };
             let key: SeKey = (strand_idx, chr_id, key_pos);
 
             if rrbs {
@@ -246,8 +299,12 @@ fn deduplicate_files(
             // PE dedup: read R2
             buf.clear();
             let n2 = reader.lines().read_until(b'\n', &mut buf)?;
-            if n2 == 0 { break; }
-            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') { buf.pop(); }
+            if n2 == 0 {
+                break;
+            }
+            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
             let r2 = buf.clone();
 
             let f2: Vec<&[u8]> = r2.splitn(11, |&b| b == b'\t').collect();
@@ -297,7 +354,9 @@ fn deduplicate_files(
         format!("\nTotal number of alignments analysed in {file_name}:\t{count}"),
         format!("Total number duplicated alignments removed:\t{removed} ({pct_rem}%)"),
         format!("Duplicated alignments were found at:\t{n_positions} different position(s)\n"),
-        format!("Total count of deduplicated leftover sequences: {leftover} ({pct_left}% of total)\n"),
+        format!(
+            "Total count of deduplicated leftover sequences: {leftover} ({pct_left}% of total)\n"
+        ),
     ];
     for l in &lines {
         eprintln!("{l}");
@@ -339,7 +398,11 @@ fn strand_index(xr: &[u8], xg: &[u8]) -> Result<u8> {
         (b"GA", b"CT") => Ok(1), // CTOT
         (b"GA", b"GA") => Ok(2), // CTOB
         (b"CT", b"GA") => Ok(3), // OB
-        _ => bail!("Unexpected XR/XG combination: {:?}/{:?}", String::from_utf8_lossy(xr), String::from_utf8_lossy(xg)),
+        _ => bail!(
+            "Unexpected XR/XG combination: {:?}/{:?}",
+            String::from_utf8_lossy(xr),
+            String::from_utf8_lossy(xg)
+        ),
     }
 }
 
@@ -366,7 +429,7 @@ fn extract_barcode(qname: &[u8], bclconvert: bool) -> Vec<u8> {
     if bclconvert {
         // bcl-convert format: ...:<UMI>_N:N:N:<index>
         if let Some(cap) = s.rfind(':') {
-            let tail = &s[cap+1..];
+            let tail = &s[cap + 1..];
             if let Some(underscore) = tail.find('_') {
                 return tail[..underscore].as_bytes().to_vec();
             }
@@ -374,7 +437,7 @@ fn extract_barcode(qname: &[u8], bclconvert: bool) -> Vec<u8> {
     } else {
         // Standard UMI: last colon-delimited field
         if let Some(pos) = s.rfind(':') {
-            return s[pos+1..].as_bytes().to_vec();
+            return s[pos + 1..].as_bytes().to_vec();
         }
     }
     qname.to_vec()
@@ -399,20 +462,31 @@ fn build_chr_map(header: &str) -> FxHashMap<Vec<u8>, u32> {
 
 fn get_sam_header(samtools: &str, path: &Path) -> Result<String> {
     let out = std::process::Command::new(samtools)
-        .args(["view", "-H"]).arg(path)
-        .output().context("samtools view -H")?;
+        .args(["view", "-H"])
+        .arg(path)
+        .output()
+        .context("samtools view -H")?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn detect_library_type(samtools: &str, path: &Path) -> Result<(bool, bool)> {
     eprintln!("Trying to determine the type of mapping from the SAM header line");
     let output = std::process::Command::new(samtools)
-        .args(["view", "-H"]).arg(path).output().context("samtools view -H")?;
+        .args(["view", "-H"])
+        .arg(path)
+        .output()
+        .context("samtools view -H")?;
     for chunk in output.stdout.split(|&b| b == b'\n') {
-        if !chunk.starts_with(b"@PG") { continue; }
+        if !chunk.starts_with(b"@PG") {
+            continue;
+        }
         let s = String::from_utf8_lossy(chunk);
-        if !s.contains("ID:Bismark") { continue; }
-        if (s.contains(" -1 ") || s.contains(" --1 ")) && (s.contains(" -2 ") || s.contains(" --2 ")) {
+        if !s.contains("ID:Bismark") {
+            continue;
+        }
+        if (s.contains(" -1 ") || s.contains(" --1 "))
+            && (s.contains(" -2 ") || s.contains(" --2 "))
+        {
             eprintln!("Treating file as paired-end data (extracted from @PG line)");
             return Ok((false, true));
         } else {
@@ -423,20 +497,33 @@ fn detect_library_type(samtools: &str, path: &Path) -> Result<(bool, bool)> {
     Ok((false, false))
 }
 
-fn open_input(samtools: &str, files: &[PathBuf], _multiple: bool) -> Result<BamReader> {
+fn open_input(
+    samtools: &str,
+    files: &[PathBuf],
+    _multiple: bool,
+    parallel: u32,
+) -> Result<BamReader> {
     // For multiple files, we could use `samtools cat -h ... | samtools view -h`,
     // but for simplicity we process only the primary file.
     // Full multi-file support would require spawning samtools cat.
-    BamReader::open(samtools, &files[0], &[])
+    let threads = parallel.to_string();
+    BamReader::open(samtools, &files[0], &["--threads", &threads])
 }
 
 fn derive_stem(path: &Path, user_outfile: Option<&str>) -> String {
-    let name = if let Some(u) = user_outfile { u } else { path.to_str().unwrap_or("") };
+    let name = if let Some(u) = user_outfile {
+        u
+    } else {
+        path.to_str().unwrap_or("")
+    };
     base_stem(name)
 }
 
 fn base_stem(name: &str) -> String {
-    let s = Path::new(name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let s = Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let s = s.trim_end_matches(".gz");
     let s = s.trim_end_matches(".sam");
     let s = s.trim_end_matches(".bam");
@@ -445,12 +532,21 @@ fn base_stem(name: &str) -> String {
 }
 
 fn normalise_dir(s: &str) -> String {
-    if s.is_empty() { return String::new(); }
-    if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.ends_with('/') {
+        s.to_string()
+    } else {
+        format!("{s}/")
+    }
 }
 
 fn parse_u32(b: &[u8]) -> u32 {
-    std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -596,7 +692,8 @@ mod tests {
 
     #[test]
     fn test_build_chr_map_basic() {
-        let header = "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:248956422\n@SQ\tSN:chr2\tLN:242193529\n";
+        let header =
+            "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:248956422\n@SQ\tSN:chr2\tLN:242193529\n";
         let map = build_chr_map(header);
         assert_eq!(map[b"chr1".as_ref()], 0);
         assert_eq!(map[b"chr2".as_ref()], 1);
@@ -610,7 +707,8 @@ mod tests {
 
     #[test]
     fn test_build_chr_map_preserves_order() {
-        let header = "@SQ\tSN:chrM\tLN:16569\n@SQ\tSN:chr1\tLN:248956422\n@SQ\tSN:chrX\tLN:156040895\n";
+        let header =
+            "@SQ\tSN:chrM\tLN:16569\n@SQ\tSN:chr1\tLN:248956422\n@SQ\tSN:chrX\tLN:156040895\n";
         let map = build_chr_map(header);
         assert_eq!(map[b"chrM".as_ref()], 0);
         assert_eq!(map[b"chr1".as_ref()], 1);
