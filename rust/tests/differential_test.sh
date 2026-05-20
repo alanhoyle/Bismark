@@ -126,6 +126,18 @@ make_workdir() {
     echo "$d"
 }
 
+make_fake_aligner_dir() {
+    local wd="$1"
+    local bin_dir="$wd/fake_aligner"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/bowtie2-build" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$bin_dir/bowtie2-build"
+    echo "$bin_dir"
+}
+
 prepare_test_files_alignment() {
     local wd="$1"
     local genome_dir="$wd/test_files"
@@ -147,6 +159,17 @@ prepare_test_files_alignment() {
     local bam="$wd/test_R1_bismark_bt2_pe.bam"
     [[ -f "$bam" ]] || die "Expected Bismark BAM not found at $bam"
     echo "$bam"
+}
+
+make_tiny_genome() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/test.fa" << 'EOF'
+>chr1 description
+ACGTNacgtn
+>chr2
+CCCCGGGGAAAATTTTNNNN
+EOF
 }
 
 cleanup() {
@@ -510,6 +533,63 @@ test_coverage2cytosine() {
     cleanup "$wd"
 }
 
+test_genome_preparation() {
+    echo ""
+    echo "=== bismark_genome_preparation ==="
+
+    local wd; wd=$(make_workdir)
+    local fake_aligner; fake_aligner=$(make_fake_aligner_dir "$wd")
+    local perl_genome="$wd/perl_genome" rust_genome="$wd/rust_genome"
+
+    make_tiny_genome "$perl_genome"
+    mkdir -p "$rust_genome"
+    cp "$perl_genome/test.fa" "$rust_genome/test.fa"
+
+    perl "$PERL_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$perl_genome" >/dev/null 2>"$wd/perl_genome_prep.err"
+
+    "$RUST_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$rust_genome" >/dev/null 2>"$wd/rust_genome_prep.err"
+
+    run_diff "genome_prep/CT_conversion" \
+        "$perl_genome/Bisulfite_Genome/CT_conversion/genome_mfa.CT_conversion.fa" \
+        "$rust_genome/Bisulfite_Genome/CT_conversion/genome_mfa.CT_conversion.fa"
+
+    run_diff "genome_prep/GA_conversion" \
+        "$perl_genome/Bisulfite_Genome/GA_conversion/genome_mfa.GA_conversion.fa" \
+        "$rust_genome/Bisulfite_Genome/GA_conversion/genome_mfa.GA_conversion.fa"
+
+    cleanup "$wd"
+}
+
+test_genome_preparation_test_files() {
+    echo ""
+    echo "=== bismark_genome_preparation test_files ==="
+
+    local wd; wd=$(make_workdir)
+    local fake_aligner; fake_aligner=$(make_fake_aligner_dir "$wd")
+    local perl_genome="$wd/perl_genome" rust_genome="$wd/rust_genome"
+    mkdir -p "$perl_genome" "$rust_genome"
+    cp "$TEST_FILES/NC_010473.fa.gz" "$perl_genome/"
+    cp "$TEST_FILES/NC_010473.fa.gz" "$rust_genome/"
+
+    perl "$PERL_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$perl_genome" >/dev/null 2>"$wd/perl_genome_prep.err"
+
+    "$RUST_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$rust_genome" >/dev/null 2>"$wd/rust_genome_prep.err"
+
+    run_diff "test_files/genome_prep_CT" \
+        "$perl_genome/Bisulfite_Genome/CT_conversion/genome_mfa.CT_conversion.fa" \
+        "$rust_genome/Bisulfite_Genome/CT_conversion/genome_mfa.CT_conversion.fa"
+
+    run_diff "test_files/genome_prep_GA" \
+        "$perl_genome/Bisulfite_Genome/GA_conversion/genome_mfa.GA_conversion.fa" \
+        "$rust_genome/Bisulfite_Genome/GA_conversion/genome_mfa.GA_conversion.fa"
+
+    cleanup "$wd"
+}
+
 test_test_files_inputs() {
     echo ""
     echo "=== test_files FASTQ-derived downstream parity ==="
@@ -575,8 +655,10 @@ test_test_files_inputs() {
 check_prereq
 
 if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+    test_genome_preparation_test_files
     test_test_files_inputs
 else
+    test_genome_preparation
     test_extractor
     test_extractor_strand_specific
     test_extractor_modes

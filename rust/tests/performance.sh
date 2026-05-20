@@ -137,6 +137,18 @@ cleanup() {
     fi
 }
 
+make_fake_aligner_dir() {
+    local wd="$1"
+    local bin_dir="$wd/fake_aligner"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/bowtie2-build" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$bin_dir/bowtie2-build"
+    echo "$bin_dir"
+}
+
 make_large_sam() {
     local out="$1" count="$2"
     perl -e '
@@ -226,6 +238,48 @@ prepare_test_files_inputs() {
         >/dev/null 2>"$wd/logs/bismark_align.err")
 
     [[ -f "$wd/test_R1_bismark_bt2_pe.bam" ]] || die "Expected Bismark BAM not found"
+}
+
+bench_genome_prep() {
+    local wd="$1" run="$2"
+    local fake_aligner="$3"
+    local perl_genome="$wd/run${run}/genome_prep/perl_genome"
+    local rust_genome="$wd/run${run}/genome_prep/rust_genome"
+    mkdir -p "$perl_genome" "$rust_genome"
+    cp "$wd/genome/chr1.fa" "$perl_genome/chr1.fa"
+    cp "$wd/genome/chr1.fa" "$rust_genome/chr1.fa"
+
+    local t
+    t="$(time_command "$wd/logs/genome_prep_perl_$run" \
+        perl "$PERL_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$perl_genome")"
+    append_result "bismark_genome_preparation" "perl" "$run" "$t"
+
+    t="$(time_command "$wd/logs/genome_prep_rust_$run" \
+        "$RUST_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$rust_genome")"
+    append_result "bismark_genome_preparation" "rust" "$run" "$t"
+}
+
+bench_test_files_genome_prep() {
+    local wd="$1" run="$2"
+    local fake_aligner="$3"
+    local perl_genome="$wd/run${run}/genome_prep/perl_genome"
+    local rust_genome="$wd/run${run}/genome_prep/rust_genome"
+    mkdir -p "$perl_genome" "$rust_genome"
+    cp "$TEST_FILES/NC_010473.fa.gz" "$perl_genome/"
+    cp "$TEST_FILES/NC_010473.fa.gz" "$rust_genome/"
+
+    local t
+    t="$(time_command "$wd/logs/test_files_genome_prep_perl_$run" \
+        perl "$PERL_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$perl_genome")"
+    append_result "test_files/bismark_genome_preparation" "perl" "$run" "$t"
+
+    t="$(time_command "$wd/logs/test_files_genome_prep_rust_$run" \
+        "$RUST_BIN/bismark_genome_preparation" \
+        --path_to_aligner "$fake_aligner" "$rust_genome")"
+    append_result "test_files/bismark_genome_preparation" "rust" "$run" "$t"
 }
 
 bench_extractor() {
@@ -429,6 +483,7 @@ WD="$(make_workdir)"
 RESULTS="$WD/results.csv"
 mkdir -p "$WD/logs"
 printf "case,implementation,seconds,run\n" > "$RESULTS"
+FAKE_ALIGNER="$(make_fake_aligner_dir "$WD")"
 
 if [[ "$USE_TEST_FILES" -eq 1 ]]; then
     echo "Preparing test_files inputs..."
@@ -443,11 +498,13 @@ for run in $(seq 1 "$RUNS"); do
     echo ""
     echo "Run $run/$RUNS"
     if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+        bench_test_files_genome_prep "$WD" "$run" "$FAKE_ALIGNER"
         bench_test_files_extractor "$WD" "$run"
         bench_test_files_dedup "$WD" "$run"
         bench_test_files_bedgraph "$WD" "$run"
         bench_test_files_coverage2cytosine "$WD" "$run"
     else
+        bench_genome_prep "$WD" "$run" "$FAKE_ALIGNER"
         bench_extractor "$WD" "$run"
         bench_dedup "$WD" "$run"
         bench_bedgraph "$WD" "$run"
