@@ -224,7 +224,7 @@ fn main() -> Result<()> {
                 continue;
             }
 
-            let pct = meth as f64 / total as f64 * 100.0;
+            let pct = format_percentage(meth, total);
             let bed_pos = pos - 1; // 0-based start
             let one_based = pos;   // 1-based end / position
 
@@ -247,6 +247,33 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_percentage(meth: u32, total: u32) -> String {
+    let pct = meth as f64 / total as f64 * 100.0;
+    if pct == 0.0 {
+        return "0".to_string();
+    }
+
+    // Perl's default numeric stringification uses roughly 15 significant
+    // digits. Match that so differential output does not diverge on values
+    // like 1/3 and 2/3.
+    let digits_before_decimal = if pct >= 1.0 {
+        pct.log10().floor() as i32 + 1
+    } else {
+        0
+    };
+    let decimals = (15 - digits_before_decimal).max(0) as usize;
+    let mut s = format!("{pct:.decimals$}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
 }
 
 fn read_methylation_file(
