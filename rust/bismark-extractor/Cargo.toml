@@ -1,0 +1,17 @@
+[package]
+name    = "bismark-extractor"
+version = "0.25.1"
+edition = "2021"
+
+[[bin]]
+name = "bismark_methylation_extractor"
+path = "src/main.rs"
+
+[dependencies]
+bismark-lib = { workspace = true }
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+flate2      = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

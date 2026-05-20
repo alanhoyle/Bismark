@@ -1,1 +1,3 @@
 .cache
+rust/target/*
+.vscode

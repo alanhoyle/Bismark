@@ -1,0 +1,13 @@
+[package]
+name    = "bismark-summary"
+version = "0.25.1"
+edition = "2021"
+
+[[bin]]
+name = "bismark2summary"
+path = "src/main.rs"
+
+[dependencies]
+bismark-lib = { workspace = true }
+clap        = { workspace = true }
+anyhow      = { workspace = true }

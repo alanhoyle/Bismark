@@ -1,0 +1,11 @@
+[package]
+name    = "bismark-lib"
+version = "0.25.1"
+edition = "2021"
+
+[dependencies]
+anyhow   = { workspace = true }
+thiserror = { workspace = true }
+flate2   = { workspace = true }
+indexmap = { workspace = true }
+walkdir  = { workspace = true }

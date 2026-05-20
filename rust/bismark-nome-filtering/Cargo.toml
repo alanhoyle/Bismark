@@ -1,0 +1,14 @@
+[package]
+name    = "bismark-nome-filtering"
+version = "0.25.1"
+edition = "2021"
+
+[[bin]]
+name = "NOMe_filtering"
+path = "src/main.rs"
+
+[dependencies]
+bismark-lib = { workspace = true }
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+flate2      = { workspace = true }
