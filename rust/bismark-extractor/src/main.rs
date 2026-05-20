@@ -8,8 +8,9 @@ use bismark_lib::BISMARK_VERSION;
 use clap::Parser;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use rayon::prelude::*;
 
-#[derive(Parser)]
+#[derive(Clone, Parser)]
 #[command(
     name = "bismark_methylation_extractor",
     about = "Extract per-cytosine methylation information from Bismark SAM/BAM files",
@@ -37,7 +38,13 @@ struct Cli {
     merge_non_cpg: bool,
 
     /// Output directory
-    #[arg(short = 'o', long = "output", alias = "output_dir", alias = "dir", default_value = "")]
+    #[arg(
+        short = 'o',
+        long = "output",
+        alias = "output_dir",
+        alias = "dir",
+        default_value = ""
+    )]
     output_dir: String,
 
     /// Omit header line from output files
@@ -108,12 +115,19 @@ struct Cli {
 // ─── Cytosine context ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum CytosineContext { CpG, CHG, CHH }
+enum CytosineContext {
+    CpG,
+    CHG,
+    CHH,
+}
 
 // ─── M-bias tracking ────────────────────────────────────────────────────────
 
 #[derive(Default)]
-struct MbiasPos { meth: u64, unmeth: u64 }
+struct MbiasPos {
+    meth: u64,
+    unmeth: u64,
+}
 
 type MbiasTable = HashMap<CytosineContext, Vec<MbiasPos>>; // indexed by read position (0-based)
 
@@ -122,28 +136,66 @@ fn mbias_add(table: &mut MbiasTable, ctx: CytosineContext, pos: usize, methylate
     if pos >= vec.len() {
         vec.resize_with(pos + 1, MbiasPos::default);
     }
-    if methylated { vec[pos].meth += 1; } else { vec[pos].unmeth += 1; }
+    if methylated {
+        vec[pos].meth += 1;
+    } else {
+        vec[pos].unmeth += 1;
+    }
 }
 
 // ─── Output file handles ────────────────────────────────────────────────────
 
 struct OutputFiles {
     // strand_specific[strand_idx][context_idx]: strand-specific mode
-    strand_specific: [[Option<Box<dyn Write>>; 3]; 4],
+    strand_specific: [[Option<OutputTarget>; 3]; 4],
     // comprehensive[context_idx]: comprehensive/CX mode
-    comprehensive: [Option<Box<dyn Write>>; 3],
+    comprehensive: [Option<OutputTarget>; 3],
     // yacht/any_c
-    any_c: Option<Box<dyn Write>>,
+    any_c: Option<OutputTarget>,
     mode: OutputMode,
+}
+
+enum OutputTarget {
+    File(Box<dyn Write + Send>),
+    Buffer(Vec<u8>),
+}
+
+impl OutputTarget {
+    fn buffer() -> Self {
+        OutputTarget::Buffer(Vec::new())
+    }
+
+    fn buffer_bytes(&self) -> Option<&[u8]> {
+        match self {
+            OutputTarget::Buffer(v) => Some(v.as_slice()),
+            OutputTarget::File(_) => None,
+        }
+    }
+}
+
+impl Write for OutputTarget {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            OutputTarget::File(w) => w.write(buf),
+            OutputTarget::Buffer(v) => v.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            OutputTarget::File(w) => w.flush(),
+            OutputTarget::Buffer(v) => v.flush(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 enum OutputMode {
-    StrandSpecific,    // 12 files (4 strands × 3 contexts)
-    Comprehensive,     // 3 files (3 contexts across all strands)
-    MergeNonCpG,       // 8 files (4 strands × [CpG, non-CpG])
-    ComprehensiveMerge,// 2 files (CpG, non-CpG)
-    Yacht,             // 1 file (all C)
+    StrandSpecific,     // 12 files (4 strands × 3 contexts)
+    Comprehensive,      // 3 files (3 contexts across all strands)
+    MergeNonCpG,        // 8 files (4 strands × [CpG, non-CpG])
+    ComprehensiveMerge, // 2 files (CpG, non-CpG)
+    Yacht,              // 1 file (all C)
 }
 
 impl OutputFiles {
@@ -161,8 +213,17 @@ impl OutputFiles {
         let ctx = context_of(call);
         let methylated = call.is_ascii_uppercase();
         let meth_strand = if methylated { b'+' } else { b'-' };
-        let strand_idx = match strand { "OT" => 0, "CTOT" => 1, "CTOB" => 2, _ => 3 };
-        let ctx_idx = match ctx { CytosineContext::CpG => 0, CytosineContext::CHG => 1, CytosineContext::CHH => 2 };
+        let strand_idx = match strand {
+            "OT" => 0,
+            "CTOT" => 1,
+            "CTOB" => 2,
+            _ => 3,
+        };
+        let ctx_idx = match ctx {
+            CytosineContext::CpG => 0,
+            CytosineContext::CHG => 1,
+            CytosineContext::CHH => 2,
+        };
 
         match self.mode {
             OutputMode::StrandSpecific => {
@@ -202,9 +263,41 @@ impl OutputFiles {
         }
         Ok(())
     }
+
+    fn append_from(&mut self, other: &OutputFiles) -> Result<()> {
+        for si in 0..4 {
+            for ci in 0..3 {
+                append_target(
+                    &mut self.strand_specific[si][ci],
+                    &other.strand_specific[si][ci],
+                )?;
+            }
+        }
+        for ci in 0..3 {
+            append_target(&mut self.comprehensive[ci], &other.comprehensive[ci])?;
+        }
+        append_target(&mut self.any_c, &other.any_c)?;
+        Ok(())
+    }
 }
 
-fn write_line(w: &mut Box<dyn Write>, id: &[u8], meth: u8, chr: &[u8], pos: u64, call: u8) -> Result<()> {
+fn append_target(dst: &mut Option<OutputTarget>, src: &Option<OutputTarget>) -> Result<()> {
+    if let (Some(d), Some(s)) = (dst, src) {
+        if let Some(bytes) = s.buffer_bytes() {
+            d.write_all(bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_line(
+    w: &mut OutputTarget,
+    id: &[u8],
+    meth: u8,
+    chr: &[u8],
+    pos: u64,
+    call: u8,
+) -> Result<()> {
     w.write_all(id)?;
     w.write_all(b"\t")?;
     w.write_all(&[meth, b'\t'])?;
@@ -232,21 +325,35 @@ fn expand_cigar(cigar: &[u8]) -> Vec<u8> {
         if b.is_ascii_digit() {
             n = n * 10 + (b - b'0') as usize;
         } else {
-            for _ in 0..n { ops.push(b); }
+            for _ in 0..n {
+                ops.push(b);
+            }
             n = 0;
         }
     }
     ops
 }
 
-fn apply_ignore_5prime(xm: &mut Vec<u8>, start: &mut u64, cigar_ops: &mut Vec<u8>, ignore: usize, forward: bool) {
-    if ignore == 0 { return; }
+fn apply_ignore_5prime(
+    xm: &mut Vec<u8>,
+    start: &mut u64,
+    cigar_ops: &mut Vec<u8>,
+    ignore: usize,
+    forward: bool,
+) {
+    if ignore == 0 {
+        return;
+    }
     let trim = ignore.min(xm.len());
     if forward {
         let trimmed_ops: Vec<u8> = cigar_ops.drain(..trim.min(cigar_ops.len())).collect();
         let mut d = 0i64;
         for &op in &trimmed_ops {
-            match op { b'D' | b'N' => d += 1, b'I' => d -= 1, _ => {} }
+            match op {
+                b'D' | b'N' => d += 1,
+                b'I' => d -= 1,
+                _ => {}
+            }
         }
         *start = (*start as i64 + ignore as i64 + d) as u64;
         xm.drain(..trim);
@@ -257,14 +364,19 @@ fn apply_ignore_5prime(xm: &mut Vec<u8>, start: &mut u64, cigar_ops: &mut Vec<u8
 }
 
 fn apply_ignore_3prime(xm: &mut Vec<u8>, cigar_ops: &mut Vec<u8>, ignore: usize) {
-    if ignore == 0 { return; }
+    if ignore == 0 {
+        return;
+    }
     let trim = ignore.min(xm.len());
     xm.truncate(xm.len().saturating_sub(trim));
     cigar_ops.truncate(cigar_ops.len().saturating_sub(trim));
 }
 
 fn mdn_count(cigar_ops: &[u8]) -> u64 {
-    cigar_ops.iter().filter(|&&b| matches!(b, b'M' | b'D' | b'N' | b'=' | b'X')).count() as u64
+    cigar_ops
+        .iter()
+        .filter(|&&b| matches!(b, b'M' | b'D' | b'N' | b'=' | b'X'))
+        .count() as u64
 }
 
 fn apply_trimming(
@@ -300,14 +412,27 @@ fn apply_trimming(
 // ─── Core extraction ────────────────────────────────────────────────────────
 
 struct Counts {
-    meth_cpg: u64, unmeth_cpg: u64,
-    meth_chg: u64, unmeth_chg: u64,
-    meth_chh: u64, unmeth_chh: u64,
+    meth_cpg: u64,
+    unmeth_cpg: u64,
+    meth_chg: u64,
+    unmeth_chg: u64,
+    meth_chh: u64,
+    unmeth_chh: u64,
     total: u64,
 }
 
 impl Counts {
-    fn new() -> Self { Counts { meth_cpg: 0, unmeth_cpg: 0, meth_chg: 0, unmeth_chg: 0, meth_chh: 0, unmeth_chh: 0, total: 0 } }
+    fn new() -> Self {
+        Counts {
+            meth_cpg: 0,
+            unmeth_cpg: 0,
+            meth_chg: 0,
+            unmeth_chg: 0,
+            meth_chh: 0,
+            unmeth_chh: 0,
+            total: 0,
+        }
+    }
     fn add_call(&mut self, call: u8) {
         match call {
             b'Z' => self.meth_cpg += 1,
@@ -320,6 +445,41 @@ impl Counts {
         }
         self.total += 1;
     }
+
+    fn merge(&mut self, other: &Counts) {
+        self.meth_cpg += other.meth_cpg;
+        self.unmeth_cpg += other.unmeth_cpg;
+        self.meth_chg += other.meth_chg;
+        self.unmeth_chg += other.unmeth_chg;
+        self.meth_chh += other.meth_chh;
+        self.unmeth_chh += other.unmeth_chh;
+        self.total += other.total;
+    }
+}
+
+fn merge_mbias(dst: &mut MbiasTable, src: &MbiasTable) {
+    for (&ctx, src_vec) in src {
+        let dst_vec = dst.entry(ctx).or_default();
+        if dst_vec.len() < src_vec.len() {
+            dst_vec.resize_with(src_vec.len(), MbiasPos::default);
+        }
+        for (i, src_pos) in src_vec.iter().enumerate() {
+            dst_vec[i].meth += src_pos.meth;
+            dst_vec[i].unmeth += src_pos.unmeth;
+        }
+    }
+}
+
+struct RecordGroup {
+    first: Vec<u8>,
+    second: Option<Vec<u8>>,
+}
+
+struct ChunkResult {
+    out: OutputFiles,
+    mbias1: MbiasTable,
+    mbias2: MbiasTable,
+    counts: Counts,
 }
 
 fn extract_calls(
@@ -332,19 +492,27 @@ fn extract_calls(
     forward: bool,        // alignment is on + strand
     read_identity: u8,    // 1 or 2 for PE
     no_overlap: bool,
-    overlap_limit: u64,   // if no_overlap, stop when pos >= overlap_limit
+    overlap_limit: u64, // if no_overlap, stop when pos >= overlap_limit
     out: &mut OutputFiles,
     mbias: &mut MbiasTable,
     mbias_only: bool,
     counts: &mut Counts,
 ) -> Result<()> {
-    if xm.is_empty() { return Ok(()); }
+    if xm.is_empty() {
+        return Ok(());
+    }
 
     // For expanded CIGAR (all-M) the offset loop is a no-op; only needed for indels.
     // `cigar` here is the already-expanded array (e.g. [M, M, M, ...]).
     // We re-expand it via expand_cigar only if it actually contains ops that need tracking.
-    let has_indels = cigar.iter().any(|&b| matches!(b, b'I' | b'D' | b'N' | b'S'));
-    let ops = if has_indels { cigar.to_vec() } else { Vec::new() };
+    let has_indels = cigar
+        .iter()
+        .any(|&b| matches!(b, b'I' | b'D' | b'N' | b'S'));
+    let ops = if has_indels {
+        cigar.to_vec()
+    } else {
+        Vec::new()
+    };
 
     let mut pos_offset: i64 = 0;
     let mut ci: usize = 0;
@@ -392,9 +560,13 @@ fn extract_calls(
         // no_overlap check
         if no_overlap && read_identity == 2 {
             if forward {
-                if pos >= overlap_limit { break; }
+                if pos >= overlap_limit {
+                    break;
+                }
             } else {
-                if pos <= overlap_limit { break; }
+                if pos <= overlap_limit {
+                    break;
+                }
             }
         }
 
@@ -409,7 +581,16 @@ fn extract_calls(
         }
 
         if !mbias_only {
-            out.write_call(id, bismark_strand, chr, pos, call, read_start, read_end, sam_strand)?;
+            out.write_call(
+                id,
+                bismark_strand,
+                chr,
+                pos,
+                call,
+                read_start,
+                read_end,
+                sam_strand,
+            )?;
         }
     }
     Ok(())
@@ -428,23 +609,22 @@ fn find_tag<'a>(fields: &[&'a [u8]], tag: &[u8]) -> Option<&'a [u8]> {
 
 fn determine_strand(xr: &[u8], xg: &[u8]) -> Option<(&'static str, bool)> {
     match (xr, xg) {
-        (b"CT", b"CT") => Some(("OT",   true)),
+        (b"CT", b"CT") => Some(("OT", true)),
         (b"GA", b"CT") => Some(("CTOT", false)),
         (b"GA", b"GA") => Some(("CTOB", true)),
-        (b"CT", b"GA") => Some(("OB",   false)),
+        (b"CT", b"GA") => Some(("OB", false)),
         _ => None,
     }
 }
 
 // ─── Output file opening ─────────────────────────────────────────────────────
 
-fn new_writer(path: &str, gzip: bool, no_header: bool) -> Result<Box<dyn Write>> {
-    let f = std::fs::File::create(path)
-        .with_context(|| format!("creating {path}"))?;
-    let mut w: Box<dyn Write> = if gzip {
-        Box::new(GzEncoder::new(f, Compression::default()))
+fn new_writer(path: &str, gzip: bool, no_header: bool) -> Result<OutputTarget> {
+    let f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+    let mut w = if gzip {
+        OutputTarget::File(Box::new(GzEncoder::new(f, Compression::default())))
     } else {
-        Box::new(BufWriter::new(f))
+        OutputTarget::File(Box::new(BufWriter::new(f)))
     };
     if !no_header {
         writeln!(w, "Bismark methylation extractor version {BISMARK_VERSION}")?;
@@ -453,13 +633,22 @@ fn new_writer(path: &str, gzip: bool, no_header: bool) -> Result<Box<dyn Write>>
     Ok(w)
 }
 
+fn new_buffer(no_header: bool) -> Result<OutputTarget> {
+    let mut w = OutputTarget::buffer();
+    if !no_header {
+        writeln!(w, "Bismark methylation extractor version {BISMARK_VERSION}")?;
+    }
+    Ok(w)
+}
+
 fn make_stem(filename: &str, output_dir: &str) -> String {
     let base = filename.split('/').last().unwrap_or(filename);
     let base = base.trim_end_matches(".gz");
-    let base = base.trim_end_matches(".bam")
-                   .trim_end_matches(".cram")
-                   .trim_end_matches(".sam")
-                   .trim_end_matches(".txt");
+    let base = base
+        .trim_end_matches(".bam")
+        .trim_end_matches(".cram")
+        .trim_end_matches(".sam")
+        .trim_end_matches(".txt");
     format!("{}{}", output_dir, base)
 }
 
@@ -470,21 +659,29 @@ fn open_outputs(stem: &str, mode: OutputMode, gzip: bool, no_header: bool) -> Re
 
     // stem = "<output_dir><basename>"; split so context prefix lands after the dir separator
     let (dir, base) = match stem.rfind('/') {
-        Some(i) => (&stem[..=i], &stem[i+1..]),
-        None    => ("", stem),
+        Some(i) => (&stem[..=i], &stem[i + 1..]),
+        None => ("", stem),
     };
 
     // Initialize with None
-    const NONE_WRITER: Option<Box<dyn Write>> = None;
-    let mut ss: [[Option<Box<dyn Write>>; 3]; 4] = [[NONE_WRITER; 3], [NONE_WRITER; 3], [NONE_WRITER; 3], [NONE_WRITER; 3]];
-    let mut comp: [Option<Box<dyn Write>>; 3] = [NONE_WRITER; 3];
-    let mut any_c: Option<Box<dyn Write>> = None;
+    const NONE_WRITER: Option<OutputTarget> = None;
+    let mut ss: [[Option<OutputTarget>; 3]; 4] = [
+        [NONE_WRITER; 3],
+        [NONE_WRITER; 3],
+        [NONE_WRITER; 3],
+        [NONE_WRITER; 3],
+    ];
+    let mut comp: [Option<OutputTarget>; 3] = [NONE_WRITER; 3];
+    let mut any_c: Option<OutputTarget> = None;
 
     match mode {
         OutputMode::StrandSpecific => {
             for si in 0..4 {
                 for ci in 0..3 {
-                    let path = format!("{dir}{}_{}_{base}{ext}", contexts[ci], strand_names_long[si]);
+                    let path = format!(
+                        "{dir}{}_{}_{base}{ext}",
+                        contexts[ci], strand_names_long[si]
+                    );
                     ss[si][ci] = Some(new_writer(&path, gzip, no_header)?);
                 }
             }
@@ -497,22 +694,86 @@ fn open_outputs(stem: &str, mode: OutputMode, gzip: bool, no_header: bool) -> Re
         }
         OutputMode::MergeNonCpG => {
             for si in 0..4 {
-                let p0 = format!("{dir}CpG_{}_{base}{ext}",    strand_names_long[si]);
+                let p0 = format!("{dir}CpG_{}_{base}{ext}", strand_names_long[si]);
                 let p1 = format!("{dir}Non_CpG_{}_{base}{ext}", strand_names_long[si]);
                 ss[si][0] = Some(new_writer(&p0, gzip, no_header)?);
                 ss[si][1] = Some(new_writer(&p1, gzip, no_header)?);
             }
         }
         OutputMode::ComprehensiveMerge => {
-            comp[0] = Some(new_writer(&format!("{dir}CpG_context_{base}{ext}"),    gzip, no_header)?);
-            comp[1] = Some(new_writer(&format!("{dir}Non_CpG_context_{base}{ext}"), gzip, no_header)?);
+            comp[0] = Some(new_writer(
+                &format!("{dir}CpG_context_{base}{ext}"),
+                gzip,
+                no_header,
+            )?);
+            comp[1] = Some(new_writer(
+                &format!("{dir}Non_CpG_context_{base}{ext}"),
+                gzip,
+                no_header,
+            )?);
         }
         OutputMode::Yacht => {
-            any_c = Some(new_writer(&format!("{dir}any_C_context_{base}{ext}"), gzip, no_header)?);
+            any_c = Some(new_writer(
+                &format!("{dir}any_C_context_{base}{ext}"),
+                gzip,
+                no_header,
+            )?);
         }
     }
 
-    Ok(OutputFiles { strand_specific: ss, comprehensive: comp, any_c, mode })
+    Ok(OutputFiles {
+        strand_specific: ss,
+        comprehensive: comp,
+        any_c,
+        mode,
+    })
+}
+
+fn open_buffer_outputs(mode: OutputMode) -> Result<OutputFiles> {
+    const NONE_WRITER: Option<OutputTarget> = None;
+    let mut ss: [[Option<OutputTarget>; 3]; 4] = [
+        [NONE_WRITER; 3],
+        [NONE_WRITER; 3],
+        [NONE_WRITER; 3],
+        [NONE_WRITER; 3],
+    ];
+    let mut comp: [Option<OutputTarget>; 3] = [NONE_WRITER; 3];
+    let mut any_c: Option<OutputTarget> = None;
+
+    match mode {
+        OutputMode::StrandSpecific => {
+            for si in 0..4 {
+                for ci in 0..3 {
+                    ss[si][ci] = Some(new_buffer(true)?);
+                }
+            }
+        }
+        OutputMode::Comprehensive => {
+            for ci in 0..3 {
+                comp[ci] = Some(new_buffer(true)?);
+            }
+        }
+        OutputMode::MergeNonCpG => {
+            for si in 0..4 {
+                ss[si][0] = Some(new_buffer(true)?);
+                ss[si][1] = Some(new_buffer(true)?);
+            }
+        }
+        OutputMode::ComprehensiveMerge => {
+            comp[0] = Some(new_buffer(true)?);
+            comp[1] = Some(new_buffer(true)?);
+        }
+        OutputMode::Yacht => {
+            any_c = Some(new_buffer(true)?);
+        }
+    }
+
+    Ok(OutputFiles {
+        strand_specific: ss,
+        comprehensive: comp,
+        any_c,
+        mode,
+    })
 }
 
 // ─── Main processing ─────────────────────────────────────────────────────────
@@ -586,7 +847,13 @@ fn process_file(
     }
 
     // Auto-detect SE/PE
-    let is_paired = if cli.single { false } else if cli.paired { true } else { detect_is_paired(samtools, path)? };
+    let is_paired = if cli.single {
+        false
+    } else if cli.paired {
+        true
+    } else {
+        detect_is_paired(samtools, path)?
+    };
     if cli.include_overlap && !is_paired {
         bail!("The option '--include_overlap' can only be specified for paired-end input");
     }
@@ -600,57 +867,71 @@ fn process_file(
 
     eprintln!("Now reading in Bismark result file {filename}");
 
-    let mut reader = BamReader::open(samtools, path, &[])?;
-    let mut buf = Vec::with_capacity(8192);
-    let mut line_count: u64 = 0;
+    let groups = read_record_groups(samtools, path, is_paired)?;
+    let line_count = groups.len() as u64;
 
-    loop {
-        buf.clear();
-        let n = reader.lines().read_until(b'\n', &mut buf)?;
-        if n == 0 { break; }
-        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') { buf.pop(); }
-        if buf.starts_with(b"@") || buf.is_empty() { continue; }
+    if cli.multicore > 1 && groups.len() > 1 {
+        let threads = cli.multicore as usize;
+        eprintln!("Processing {line_count} record groups with {threads} worker threads");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .context("building Rayon thread pool")?;
+        let chunk_results: Vec<Result<ChunkResult>> = pool.install(|| {
+            (0..threads)
+                .into_par_iter()
+                .map(|worker_idx| {
+                    let mut chunk_out = open_buffer_outputs(mode)?;
+                    let mut chunk_mbias1: MbiasTable = HashMap::new();
+                    let mut chunk_mbias2: MbiasTable = HashMap::new();
+                    let mut chunk_counts = Counts::new();
+                    for group in groups.iter().skip(worker_idx).step_by(threads) {
+                        process_record_group(
+                            group,
+                            is_paired,
+                            cli,
+                            no_overlap,
+                            &mut chunk_out,
+                            &mut chunk_mbias1,
+                            &mut chunk_mbias2,
+                            &mut chunk_counts,
+                        )?;
+                    }
+                    Ok(ChunkResult {
+                        out: chunk_out,
+                        mbias1: chunk_mbias1,
+                        mbias2: chunk_mbias2,
+                        counts: chunk_counts,
+                    })
+                })
+                .collect()
+        });
 
-        line_count += 1;
-        if line_count % 500_000 == 0 { eprintln!("Processed {line_count} lines"); }
-
-        let fields: Vec<&[u8]> = buf.split(|&b| b == b'\t').collect();
-        if fields.len() < 11 { continue; }
-
-        let id   = fields[0];
-        let chr  = fields[2];
-        let pos: u64 = std::str::from_utf8(fields[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let cigar = fields[5];
-
-        let xm = match find_tag(&fields, b"XM:Z:") { Some(x) => x, None => continue };
-        let xr = match find_tag(&fields, b"XR:Z:") { Some(x) => x, None => continue };
-        let xg = match find_tag(&fields, b"XG:Z:") { Some(x) => x, None => continue };
-
-        let (bismark_strand, forward) = match determine_strand(xr, xg) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let mut xm_vec: Vec<u8> = xm.to_vec();
-        if !forward { xm_vec.reverse(); }
-
-        let mut cigar_ops = if cigar != b"*" { expand_cigar(cigar) } else { Vec::new() };
-        if !forward { cigar_ops.reverse(); }
-
-        let mut start = pos;
-
-        if is_paired {
-            process_pair(
-                &buf, &mut reader, id, chr, start, cigar_ops, xm_vec,
-                bismark_strand, forward, cli, no_overlap, &mut out, &mut mbias1, &mut mbias2, &mut counts,
+        for chunk_result in chunk_results {
+            let chunk_result = chunk_result?;
+            out.append_from(&chunk_result.out)?;
+            merge_mbias(&mut mbias1, &chunk_result.mbias1);
+            merge_mbias(&mut mbias2, &chunk_result.mbias2);
+            counts.merge(&chunk_result.counts);
+        }
+    } else {
+        for (idx, group) in groups.iter().enumerate() {
+            let processed = idx as u64 + 1;
+            if processed % 500_000 == 0 {
+                eprintln!("Processed {processed} lines");
+            }
+            process_record_group(
+                group,
+                is_paired,
+                cli,
+                no_overlap,
+                &mut out,
+                &mut mbias1,
+                &mut mbias2,
+                &mut counts,
             )?;
-        } else {
-            apply_trimming(&mut xm_vec, &mut start, &mut cigar_ops, cli.ignore, cli.ignore_3prime, forward);
-            extract_calls(&xm_vec, &cigar_ops, start, chr, id, bismark_strand, forward, 1,
-                false, 0, &mut out, &mut mbias1, cli.mbias_only, &mut counts)?;
         }
     }
-    reader.finish()?;
 
     // Write M-bias report
     if !cli.mbias_off {
@@ -669,16 +950,63 @@ fn process_file(
     Ok(())
 }
 
-fn process_pair(
-    _r1_buf: &[u8],
-    reader: &mut BamReader,
-    id1: &[u8],
-    chr: &[u8],
-    start_r1: u64,
-    mut cigar_ops_r1: Vec<u8>,
-    mut xm_r1: Vec<u8>,
-    bismark_strand: &str,
-    forward: bool,  // R1 forward
+fn read_record_groups(samtools: &str, path: &Path, is_paired: bool) -> Result<Vec<RecordGroup>> {
+    let mut reader = BamReader::open(samtools, path, &[])?;
+    let mut buf = Vec::with_capacity(8192);
+    let mut groups = Vec::new();
+
+    loop {
+        buf.clear();
+        let n = reader.lines().read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        if buf.starts_with(b"@") || buf.is_empty() {
+            continue;
+        }
+
+        if is_paired {
+            let mut r2_buf = Vec::with_capacity(8192);
+            loop {
+                r2_buf.clear();
+                let n = reader.lines().read_until(b'\n', &mut r2_buf)?;
+                if n == 0 {
+                    groups.push(RecordGroup {
+                        first: buf.clone(),
+                        second: None,
+                    });
+                    reader.finish()?;
+                    return Ok(groups);
+                }
+                while r2_buf.last() == Some(&b'\n') || r2_buf.last() == Some(&b'\r') {
+                    r2_buf.pop();
+                }
+                if r2_buf.starts_with(b"@") || r2_buf.is_empty() {
+                    continue;
+                }
+                break;
+            }
+            groups.push(RecordGroup {
+                first: buf.clone(),
+                second: Some(r2_buf),
+            });
+        } else {
+            groups.push(RecordGroup {
+                first: buf.clone(),
+                second: None,
+            });
+        }
+    }
+    reader.finish()?;
+    Ok(groups)
+}
+
+fn process_record_group(
+    group: &RecordGroup,
+    is_paired: bool,
     cli: &Cli,
     no_overlap: bool,
     out: &mut OutputFiles,
@@ -686,27 +1014,146 @@ fn process_pair(
     mbias2: &mut MbiasTable,
     counts: &mut Counts,
 ) -> Result<()> {
-    let mut r2_buf = Vec::with_capacity(8192);
-    loop {
-        r2_buf.clear();
-        let n = reader.lines().read_until(b'\n', &mut r2_buf)?;
-        if n == 0 { return Ok(()); }
-        while r2_buf.last() == Some(&b'\n') || r2_buf.last() == Some(&b'\r') { r2_buf.pop(); }
-        if r2_buf.starts_with(b"@") || r2_buf.is_empty() { continue; }
-        break;
+    let buf = &group.first;
+
+    let fields: Vec<&[u8]> = buf.split(|&b| b == b'\t').collect();
+    if fields.len() < 11 {
+        return Ok(());
     }
 
-    let fields2: Vec<&[u8]> = r2_buf.split(|&b| b == b'\t').collect();
-    if fields2.len() < 11 { return Ok(()); }
+    let id = fields[0];
+    let chr = fields[2];
+    let pos: u64 = std::str::from_utf8(fields[3])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let cigar = fields[5];
 
-    let id2    = fields2[0];
-    let chr2   = fields2[2];
-    let pos2: u64 = std::str::from_utf8(fields2[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let xm = match find_tag(&fields, b"XM:Z:") {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+    let xr = match find_tag(&fields, b"XR:Z:") {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+    let xg = match find_tag(&fields, b"XG:Z:") {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+
+    let (bismark_strand, forward) = match determine_strand(xr, xg) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let mut xm_vec: Vec<u8> = xm.to_vec();
+    if !forward {
+        xm_vec.reverse();
+    }
+
+    let mut cigar_ops = if cigar != b"*" {
+        expand_cigar(cigar)
+    } else {
+        Vec::new()
+    };
+    if !forward {
+        cigar_ops.reverse();
+    }
+
+    let mut start = pos;
+
+    if is_paired {
+        process_pair(
+            group.second.as_deref(),
+            id,
+            chr,
+            start,
+            cigar_ops,
+            xm_vec,
+            bismark_strand,
+            forward,
+            cli,
+            no_overlap,
+            out,
+            mbias1,
+            mbias2,
+            counts,
+        )?;
+    } else {
+        apply_trimming(
+            &mut xm_vec,
+            &mut start,
+            &mut cigar_ops,
+            cli.ignore,
+            cli.ignore_3prime,
+            forward,
+        );
+        extract_calls(
+            &xm_vec,
+            &cigar_ops,
+            start,
+            chr,
+            id,
+            bismark_strand,
+            forward,
+            1,
+            false,
+            0,
+            out,
+            mbias1,
+            cli.mbias_only,
+            counts,
+        )?;
+    }
+    Ok(())
+}
+
+fn process_pair(
+    r2_buf: Option<&[u8]>,
+    id1: &[u8],
+    chr: &[u8],
+    start_r1: u64,
+    mut cigar_ops_r1: Vec<u8>,
+    mut xm_r1: Vec<u8>,
+    bismark_strand: &str,
+    forward: bool, // R1 forward
+    cli: &Cli,
+    no_overlap: bool,
+    out: &mut OutputFiles,
+    mbias1: &mut MbiasTable,
+    mbias2: &mut MbiasTable,
+    counts: &mut Counts,
+) -> Result<()> {
+    let Some(r2_buf) = r2_buf else {
+        return Ok(());
+    };
+
+    let fields2: Vec<&[u8]> = r2_buf.split(|&b| b == b'\t').collect();
+    if fields2.len() < 11 {
+        return Ok(());
+    }
+
+    let id2 = fields2[0];
+    let chr2 = fields2[2];
+    let pos2: u64 = std::str::from_utf8(fields2[3])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let cigar2 = fields2[5];
 
-    let xm2 = match find_tag(&fields2, b"XM:Z:") { Some(x) => x, None => return Ok(()) };
-    let xr2 = match find_tag(&fields2, b"XR:Z:") { Some(x) => x, None => return Ok(()) };
-    let xg2 = match find_tag(&fields2, b"XG:Z:") { Some(x) => x, None => return Ok(()) };
+    let xm2 = match find_tag(&fields2, b"XM:Z:") {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+    let xr2 = match find_tag(&fields2, b"XR:Z:") {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+    let xg2 = match find_tag(&fields2, b"XG:Z:") {
+        Some(x) => x,
+        None => return Ok(()),
+    };
 
     let (strand2, forward2) = match determine_strand(xr2, xg2) {
         Some(s) => s,
@@ -714,62 +1161,130 @@ fn process_pair(
     };
 
     let mut xm2_vec: Vec<u8> = xm2.to_vec();
-    if !forward2 { xm2_vec.reverse(); }
-    let mut cigar2_ops = if cigar2 != b"*" { expand_cigar(cigar2) } else { Vec::new() };
-    if !forward2 { cigar2_ops.reverse(); }
+    if !forward2 {
+        xm2_vec.reverse();
+    }
+    let mut cigar2_ops = if cigar2 != b"*" {
+        expand_cigar(cigar2)
+    } else {
+        Vec::new()
+    };
+    if !forward2 {
+        cigar2_ops.reverse();
+    }
     let mut start_r2 = pos2;
 
     let mut start_r1 = start_r1;
-    apply_trimming(&mut xm_r1, &mut start_r1, &mut cigar_ops_r1, cli.ignore, cli.ignore_3prime, forward);
-    apply_trimming(&mut xm2_vec, &mut start_r2, &mut cigar2_ops, cli.ignore_r2, cli.ignore_3prime_r2, forward2);
+    apply_trimming(
+        &mut xm_r1,
+        &mut start_r1,
+        &mut cigar_ops_r1,
+        cli.ignore,
+        cli.ignore_3prime,
+        forward,
+    );
+    apply_trimming(
+        &mut xm2_vec,
+        &mut start_r2,
+        &mut cigar2_ops,
+        cli.ignore_r2,
+        cli.ignore_3prime_r2,
+        forward2,
+    );
 
     let mdn1 = mdn_count(&cigar_ops_r1);
     let (r1_start_eff, r2_start_eff, end_r1) = if forward {
-        (start_r1,
-         start_r2,
-         start_r1 + mdn1.saturating_sub(1))
+        (start_r1, start_r2, start_r1 + mdn1.saturating_sub(1))
     } else {
-        (start_r1,
-         start_r2,
-         start_r1.saturating_sub(mdn1.saturating_sub(1)))
+        (
+            start_r1,
+            start_r2,
+            start_r1.saturating_sub(mdn1.saturating_sub(1)),
+        )
     };
 
     // Extract R1
-    extract_calls(&xm_r1, &cigar_ops_r1, r1_start_eff, chr, id1, bismark_strand, forward,
-        1, false, 0, out, mbias1, cli.mbias_only, counts)?;
+    extract_calls(
+        &xm_r1,
+        &cigar_ops_r1,
+        r1_start_eff,
+        chr,
+        id1,
+        bismark_strand,
+        forward,
+        1,
+        false,
+        0,
+        out,
+        mbias1,
+        cli.mbias_only,
+        counts,
+    )?;
 
     // Extract R2 (with optional no_overlap)
-    extract_calls(&xm2_vec, &cigar2_ops, r2_start_eff, chr2, id2, strand2, forward2,
-        2, no_overlap, end_r1, out, mbias2, cli.mbias_only, counts)?;
+    extract_calls(
+        &xm2_vec,
+        &cigar2_ops,
+        r2_start_eff,
+        chr2,
+        id2,
+        strand2,
+        forward2,
+        2,
+        no_overlap,
+        end_r1,
+        out,
+        mbias2,
+        cli.mbias_only,
+        counts,
+    )?;
 
     Ok(())
 }
 
 // ─── M-bias report ────────────────────────────────────────────────────────────
 
-fn write_mbias_report(stem: &str, mbias1: &MbiasTable, mbias2: &MbiasTable, is_paired: bool) -> Result<()> {
+fn write_mbias_report(
+    stem: &str,
+    mbias1: &MbiasTable,
+    mbias2: &MbiasTable,
+    is_paired: bool,
+) -> Result<()> {
     let path = format!("{stem}M-bias.txt");
-    let mut f = std::fs::File::create(&path)
-        .with_context(|| format!("creating {path}"))?;
+    let mut f = std::fs::File::create(&path).with_context(|| format!("creating {path}"))?;
 
     writeln!(f, "CpG context\tRead 1")?;
-    writeln!(f, "position\tcount methylated\tcount unmethylated\t% methylation\tcoverage")?;
+    writeln!(
+        f,
+        "position\tcount methylated\tcount unmethylated\t% methylation\tcoverage"
+    )?;
     write_mbias_context(&mut f, mbias1, CytosineContext::CpG)?;
 
     if is_paired {
         writeln!(f, "\nCpG context\tRead 2")?;
-        writeln!(f, "position\tcount methylated\tcount unmethylated\t% methylation\tcoverage")?;
+        writeln!(
+            f,
+            "position\tcount methylated\tcount unmethylated\t% methylation\tcoverage"
+        )?;
         write_mbias_context(&mut f, mbias2, CytosineContext::CpG)?;
     }
 
     Ok(())
 }
 
-fn write_mbias_context(f: &mut std::fs::File, table: &MbiasTable, ctx: CytosineContext) -> Result<()> {
+fn write_mbias_context(
+    f: &mut std::fs::File,
+    table: &MbiasTable,
+    ctx: CytosineContext,
+) -> Result<()> {
     if let Some(vec) = table.get(&ctx) {
         for (i, p) in vec.iter().enumerate() {
             let cov = p.meth + p.unmeth;
-            let pct = if cov > 0 { format!("{:.2}", p.meth as f64 / cov as f64 * 100.0) } else { "0.00".into() };
+            let pct = if cov > 0 {
+                format!("{:.2}", p.meth as f64 / cov as f64 * 100.0)
+            } else {
+                "0.00".into()
+            };
             writeln!(f, "{}\t{}\t{}\t{pct}\t{cov}", i + 1, p.meth, p.unmeth)?;
         }
     }
@@ -780,32 +1295,76 @@ fn write_mbias_context(f: &mut std::fs::File, table: &MbiasTable, ctx: CytosineC
 
 fn write_splitting_report(stem: &str, counts: &Counts, is_paired: bool) -> Result<()> {
     let path = format!("{stem}_splitting_report.txt");
-    let mut f = std::fs::File::create(&path)
-        .with_context(|| format!("creating {path}"))?;
+    let mut f = std::fs::File::create(&path).with_context(|| format!("creating {path}"))?;
 
-    let mode = if is_paired { "paired-end" } else { "single-end" };
+    let mode = if is_paired {
+        "paired-end"
+    } else {
+        "single-end"
+    };
     writeln!(f, "Bismark Extractor Version: {BISMARK_VERSION}")?;
     writeln!(f, "Bismark result file: {mode} (SAM format)")?;
     writeln!(f)?;
     writeln!(f, "Final Cytosine Methylation Report")?;
     writeln!(f, "=================================")?;
-    let total = counts.meth_cpg + counts.unmeth_cpg + counts.meth_chg + counts.unmeth_chg + counts.meth_chh + counts.unmeth_chh;
+    let total = counts.meth_cpg
+        + counts.unmeth_cpg
+        + counts.meth_chg
+        + counts.unmeth_chg
+        + counts.meth_chh
+        + counts.unmeth_chh;
     writeln!(f, "Total number of C's analysed:\t{total}")?;
     writeln!(f)?;
-    writeln!(f, "Total methylated C's in CpG context:\t{}", counts.meth_cpg)?;
-    writeln!(f, "Total methylated C's in CHG context:\t{}", counts.meth_chg)?;
-    writeln!(f, "Total methylated C's in CHH context:\t{}", counts.meth_chh)?;
+    writeln!(
+        f,
+        "Total methylated C's in CpG context:\t{}",
+        counts.meth_cpg
+    )?;
+    writeln!(
+        f,
+        "Total methylated C's in CHG context:\t{}",
+        counts.meth_chg
+    )?;
+    writeln!(
+        f,
+        "Total methylated C's in CHH context:\t{}",
+        counts.meth_chh
+    )?;
     writeln!(f)?;
-    writeln!(f, "Total unmethylated C's in CpG context:\t{}", counts.unmeth_cpg)?;
-    writeln!(f, "Total unmethylated C's in CHG context:\t{}", counts.unmeth_chg)?;
-    writeln!(f, "Total unmethylated C's in CHH context:\t{}", counts.unmeth_chh)?;
+    writeln!(
+        f,
+        "Total unmethylated C's in CpG context:\t{}",
+        counts.unmeth_cpg
+    )?;
+    writeln!(
+        f,
+        "Total unmethylated C's in CHG context:\t{}",
+        counts.unmeth_chg
+    )?;
+    writeln!(
+        f,
+        "Total unmethylated C's in CHH context:\t{}",
+        counts.unmeth_chh
+    )?;
     writeln!(f)?;
     let cpg_total = counts.meth_cpg + counts.unmeth_cpg;
     let chg_total = counts.meth_chg + counts.unmeth_chg;
     let chh_total = counts.meth_chh + counts.unmeth_chh;
-    let pct_cpg = if cpg_total > 0 { format!("{:.1}", counts.meth_cpg as f64 / cpg_total as f64 * 100.0) } else { "N/A".into() };
-    let pct_chg = if chg_total > 0 { format!("{:.1}", counts.meth_chg as f64 / chg_total as f64 * 100.0) } else { "N/A".into() };
-    let pct_chh = if chh_total > 0 { format!("{:.1}", counts.meth_chh as f64 / chh_total as f64 * 100.0) } else { "N/A".into() };
+    let pct_cpg = if cpg_total > 0 {
+        format!("{:.1}", counts.meth_cpg as f64 / cpg_total as f64 * 100.0)
+    } else {
+        "N/A".into()
+    };
+    let pct_chg = if chg_total > 0 {
+        format!("{:.1}", counts.meth_chg as f64 / chg_total as f64 * 100.0)
+    } else {
+        "N/A".into()
+    };
+    let pct_chh = if chh_total > 0 {
+        format!("{:.1}", counts.meth_chh as f64 / chh_total as f64 * 100.0)
+    } else {
+        "N/A".into()
+    };
     writeln!(f, "C methylated in CpG context:\t{pct_cpg}%")?;
     writeln!(f, "C methylated in CHG context:\t{pct_chg}%")?;
     writeln!(f, "C methylated in CHH context:\t{pct_chh}%")?;
@@ -816,19 +1375,32 @@ fn write_splitting_report(stem: &str, counts: &Counts, is_paired: bool) -> Resul
 
 fn detect_is_paired(samtools: &str, path: &Path) -> Result<bool> {
     let output = std::process::Command::new(samtools)
-        .args(["view", "-H"]).arg(path).output().context("samtools view -H")?;
+        .args(["view", "-H"])
+        .arg(path)
+        .output()
+        .context("samtools view -H")?;
     for chunk in output.stdout.split(|&b| b == b'\n') {
-        if !chunk.starts_with(b"@PG") { continue; }
+        if !chunk.starts_with(b"@PG") {
+            continue;
+        }
         let s = String::from_utf8_lossy(chunk);
-        if s.contains(" -1 ") && s.contains(" -2 ") { return Ok(true); }
+        if s.contains(" -1 ") && s.contains(" -2 ") {
+            return Ok(true);
+        }
         return Ok(false);
     }
     Ok(false)
 }
 
 fn normalise_dir(s: &str) -> String {
-    if s.is_empty() { return String::new(); }
-    if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.ends_with('/') {
+        s.to_string()
+    } else {
+        format!("{s}/")
+    }
 }
 
 #[cfg(test)]

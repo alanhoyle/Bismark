@@ -102,6 +102,20 @@ run_diff_gz() {
     fi
 }
 
+run_diff_text_sorted() {
+    # Parallel extraction can emit complete read groups in worker order. Sort
+    # text calls when the test is about content parity rather than stream order.
+    local name="$1" left_file="$2" right_file="$3"
+    if diff -q <(sort "$left_file") <(sort "$right_file") >/dev/null 2>&1; then
+        echo "  PASS  $name (sorted)"
+        PASS=$(( PASS + 1 ))
+    else
+        echo "  FAIL  $name (sorted)"
+        diff --unified=3 <(sort "$left_file") <(sort "$right_file") | head -30 || true
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
 run_diff_sorted() {
     # For BAM outputs: sort SAM records before diffing (order may differ)
     local name="$1" perl_bam="$2" rust_bam="$3"
@@ -249,6 +263,23 @@ compare_context_outputs() {
     done
 }
 
+compare_context_outputs_sorted() {
+    local label="$1" left_dir="$2" right_dir="$3"
+    local ctx left_f right_f
+    for ctx in CpG CHG CHH; do
+        left_f=$(find_one "$left_dir" "${ctx}_context_*.txt")
+        right_f=$(find_one "$right_dir" "${ctx}_context_*.txt")
+        if [[ -z "$left_f" && -z "$right_f" ]]; then
+            continue
+        elif [[ -n "$left_f" && -n "$right_f" ]]; then
+            run_diff_text_sorted "$label/$ctx" "$left_f" "$right_f"
+        else
+            echo "  FAIL  $label/$ctx (missing file: left=$left_f right=$right_f)"
+            FAIL=$(( FAIL + 1 ))
+        fi
+    done
+}
+
 # ─── Test: bismark_methylation_extractor ─────────────────────────────────────
 
 test_extractor() {
@@ -389,6 +420,29 @@ test_extractor_paired_overlap() {
         --dir "$rust_dir" "$sam" 2>/dev/null
     run_diff "extractor/paired_include_overlap" "$(find_one "$perl_dir" "CpG_context_*.txt")" "$(find_one "$rust_dir" "CpG_context_*.txt")"
 
+    cleanup "$wd"
+}
+
+test_extractor_parallel() {
+    echo ""
+    echo "=== bismark_methylation_extractor parallel ==="
+
+    local wd; wd=$(make_workdir)
+    local perl_dir="$wd/perl" rust_dir="$wd/rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+
+    local sam="$wd/test.sam"
+    make_tiny_sam "$sam"
+
+    perl "$PERL_BIN/bismark_methylation_extractor" \
+        --single --no_header --mbias_off --comprehensive --parallel 2 \
+        --output "$perl_dir" "$sam" 2>/dev/null
+
+    "$RUST_BIN/bismark_methylation_extractor" \
+        --single --no_header --mbias_off --comprehensive --parallel 2 \
+        --dir "$rust_dir" "$sam" 2>/dev/null
+
+    compare_context_outputs "parallel" "$perl_dir" "$rust_dir"
     cleanup "$wd"
 }
 
@@ -608,6 +662,13 @@ test_test_files_inputs() {
         --dir "$rust_dir" "$bam" 2>/dev/null
     compare_context_outputs "test_files/extractor" "$perl_dir" "$rust_dir"
 
+    local rust_parallel_dir="$wd/extractor_parallel_rust"
+    mkdir -p "$rust_parallel_dir"
+    "$RUST_BIN/bismark_methylation_extractor" \
+        --paired --no_header --mbias_off --comprehensive --parallel 2 \
+        --dir "$rust_parallel_dir" "$bam" 2>/dev/null
+    compare_context_outputs_sorted "test_files/extractor_parallel" "$rust_dir" "$rust_parallel_dir"
+
     perl_dir="$wd/dedup_perl"; rust_dir="$wd/dedup_rust"
     mkdir -p "$perl_dir" "$rust_dir"
     cp "$bam" "$perl_dir/test.bam"
@@ -663,6 +724,7 @@ else
     test_extractor_strand_specific
     test_extractor_modes
     test_extractor_paired_overlap
+    test_extractor_parallel
     test_dedup
     test_bedgraph
     test_coverage2cytosine
