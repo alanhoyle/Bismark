@@ -3,7 +3,7 @@
 # tools on synthetic inputs and report wall-clock timing summaries.
 #
 # Usage:
-#   ./rust/tests/performance.sh [--runs N] [--records N] [--keep] [--test-files]
+#   ./rust/tests/performance.sh [--runs N] [--records N] [--threads N] [--keep] [--test-files]
 #
 # Requirements:
 #   - samtools in PATH
@@ -25,6 +25,7 @@ TEST_FILES="$REPO_ROOT/test_files"
 
 RUNS=3
 RECORDS=50000
+THREADS=1
 KEEP=0
 USE_TEST_FILES=0
 
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --records)
             RECORDS="${2:-}"
+            shift 2
+            ;;
+        --threads)
+            THREADS="${2:-}"
             shift 2
             ;;
         --keep)
@@ -62,6 +67,7 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 check_prereq() {
     [[ "$RUNS" =~ ^[0-9]+$ && "$RUNS" -gt 0 ]] || die "--runs must be a positive integer"
     [[ "$RECORDS" =~ ^[0-9]+$ && "$RECORDS" -gt 0 ]] || die "--records must be a positive integer"
+    [[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -gt 0 ]] || die "--threads must be a positive integer"
     command -v samtools >/dev/null 2>&1 || die "samtools not in PATH"
     [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
         || die "Rust binaries not built - run: cargo build --release --workspace"
@@ -250,14 +256,19 @@ bench_genome_prep() {
     cp "$wd/genome/chr1.fa" "$rust_genome/chr1.fa"
 
     local t
+    local perl_cmd=(perl "$PERL_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
+    local rust_cmd=("$RUST_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
+    if [[ "$THREADS" -gt 1 ]]; then
+        perl_cmd+=(--parallel "$THREADS")
+        rust_cmd+=(--parallel "$THREADS")
+    fi
+
     t="$(time_command "$wd/logs/genome_prep_perl_$run" \
-        perl "$PERL_BIN/bismark_genome_preparation" \
-        --path_to_aligner "$fake_aligner" "$perl_genome")"
+        "${perl_cmd[@]}" "$perl_genome")"
     append_result "bismark_genome_preparation" "perl" "$run" "$t"
 
     t="$(time_command "$wd/logs/genome_prep_rust_$run" \
-        "$RUST_BIN/bismark_genome_preparation" \
-        --path_to_aligner "$fake_aligner" "$rust_genome")"
+        "${rust_cmd[@]}" "$rust_genome")"
     append_result "bismark_genome_preparation" "rust" "$run" "$t"
 }
 
@@ -271,14 +282,19 @@ bench_test_files_genome_prep() {
     cp "$TEST_FILES/NC_010473.fa.gz" "$rust_genome/"
 
     local t
+    local perl_cmd=(perl "$PERL_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
+    local rust_cmd=("$RUST_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
+    if [[ "$THREADS" -gt 1 ]]; then
+        perl_cmd+=(--parallel "$THREADS")
+        rust_cmd+=(--parallel "$THREADS")
+    fi
+
     t="$(time_command "$wd/logs/test_files_genome_prep_perl_$run" \
-        perl "$PERL_BIN/bismark_genome_preparation" \
-        --path_to_aligner "$fake_aligner" "$perl_genome")"
+        "${perl_cmd[@]}" "$perl_genome")"
     append_result "test_files/bismark_genome_preparation" "perl" "$run" "$t"
 
     t="$(time_command "$wd/logs/test_files_genome_prep_rust_$run" \
-        "$RUST_BIN/bismark_genome_preparation" \
-        --path_to_aligner "$fake_aligner" "$rust_genome")"
+        "${rust_cmd[@]}" "$rust_genome")"
     append_result "test_files/bismark_genome_preparation" "rust" "$run" "$t"
 }
 
@@ -291,13 +307,13 @@ bench_extractor() {
     local t
     t="$(time_command "$wd/logs/extractor_perl_$run" \
         perl "$PERL_BIN/bismark_methylation_extractor" \
-        --single --no_header --mbias_off --comprehensive \
+        --single --no_header --mbias_off --comprehensive --parallel "$THREADS" \
         --output "$perl_dir" "$wd/large.sam")"
     append_result "bismark_methylation_extractor" "perl" "$run" "$t"
 
     t="$(time_command "$wd/logs/extractor_rust_$run" \
         "$RUST_BIN/bismark_methylation_extractor" \
-        --single --no_header --mbias_off --comprehensive \
+        --single --no_header --mbias_off --comprehensive --parallel "$THREADS" \
         --dir "$rust_dir" "$wd/large.sam")"
     append_result "bismark_methylation_extractor" "rust" "$run" "$t"
 }
@@ -311,13 +327,13 @@ bench_test_files_extractor() {
     local t
     t="$(time_command "$wd/logs/test_files_extractor_perl_$run" \
         perl "$PERL_BIN/bismark_methylation_extractor" \
-        --paired --no_header --mbias_off --comprehensive \
+        --paired --no_header --mbias_off --comprehensive --parallel "$THREADS" \
         --output "$perl_dir" "$wd/test_R1_bismark_bt2_pe.bam")"
     append_result "test_files/bismark_methylation_extractor" "perl" "$run" "$t"
 
     t="$(time_command "$wd/logs/test_files_extractor_rust_$run" \
         "$RUST_BIN/bismark_methylation_extractor" \
-        --paired --no_header --mbias_off --comprehensive \
+        --paired --no_header --mbias_off --comprehensive --parallel "$THREADS" \
         --dir "$rust_dir" "$wd/test_R1_bismark_bt2_pe.bam")"
     append_result "test_files/bismark_methylation_extractor" "rust" "$run" "$t"
 }
@@ -495,7 +511,7 @@ else
     prepare_inputs "$WD"
 fi
 
-echo "Running $RUNS benchmark run(s)..."
+echo "Running $RUNS benchmark run(s) with $THREADS thread(s) where supported..."
 for run in $(seq 1 "$RUNS"); do
     echo ""
     echo "Run $run/$RUNS"
