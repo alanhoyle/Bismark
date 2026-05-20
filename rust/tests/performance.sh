@@ -447,11 +447,13 @@ bench_test_files_coverage2cytosine() {
 print_summary() {
     local cases
     cases="$(awk -F, 'NR > 1 { seen[$1] = 1 } END { for (c in seen) print c }' "$RESULTS" | sort)"
+    local case_width
+    case_width="$(awk -F, 'NR > 1 { if (length($1) > max) max = length($1) } END { print (max > 4 ? max : 4) }' "$RESULTS")"
 
     echo ""
     echo "Performance summary (seconds; lower is better)"
-    printf "%-32s %10s %10s %10s %10s %10s\n" "case" "perl avg" "rust avg" "speedup" "perl min" "rust min"
-    printf "%-32s %10s %10s %10s %10s %10s\n" "----" "--------" "--------" "-------" "--------" "--------"
+    printf "%-*s  %10s  %10s  %10s  %10s  %10s\n" "$case_width" "case" "perl avg" "rust avg" "speedup" "perl min" "rust min"
+    printf "%-*s  %10s  %10s  %10s  %10s  %10s\n" "$case_width" "----" "--------" "--------" "-------" "--------" "--------"
 
     while IFS= read -r case_name; do
         [[ -n "$case_name" ]] || continue
@@ -464,8 +466,8 @@ print_summary() {
         rust_avg="$(mean_csv "$rust_csv")"
         perl_min="$(min_csv "$perl_csv")"
         rust_min="$(min_csv "$rust_csv")"
-        printf "%-32s %10.3f %10.3f %10s %10.3f %10.3f\n" \
-            "$case_name" "$perl_avg" "$rust_avg" "$(ratio "$perl_avg" "$rust_avg")" "$perl_min" "$rust_min"
+        printf "%-*s  %10.3f  %10.3f  %10s  %10.3f  %10.3f\n" \
+            "$case_width" "$case_name" "$perl_avg" "$rust_avg" "$(ratio "$perl_avg" "$rust_avg")" "$perl_min" "$rust_min"
         rm -f "$perl_csv" "$rust_csv"
     done <<< "$cases"
 
