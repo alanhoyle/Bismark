@@ -3,12 +3,13 @@
 # tools on synthetic inputs and report wall-clock timing summaries.
 #
 # Usage:
-#   ./rust/tests/performance.sh [--runs N] [--records N] [--keep]
+#   ./rust/tests/performance.sh [--runs N] [--records N] [--keep] [--test-files]
 #
 # Requirements:
 #   - samtools in PATH
 #   - Perl scripts at ../  (relative to rust/)
 #   - Rust binaries built: cargo build --release --workspace
+#   - bowtie2/bowtie2-build in PATH when using --test-files
 #
 # Notes:
 #   This is a lightweight benchmark harness, not a statistical benchmark suite.
@@ -20,10 +21,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUST_BIN="$SCRIPT_DIR/../target/release"
 PERL_BIN="$REPO_ROOT"
+TEST_FILES="$REPO_ROOT/test_files"
 
 RUNS=3
 RECORDS=50000
 KEEP=0
+USE_TEST_FILES=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -37,6 +40,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --keep)
             KEEP=1
+            shift
+            ;;
+        --test-files)
+            USE_TEST_FILES=1
             shift
             ;;
         -h|--help)
@@ -58,6 +65,13 @@ check_prereq() {
     command -v samtools >/dev/null 2>&1 || die "samtools not in PATH"
     [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
         || die "Rust binaries not built - run: cargo build --release --workspace"
+    if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+        [[ -f "$TEST_FILES/NC_010473.fa.gz" ]] || die "NC_010473.fa.gz not found"
+        [[ -f "$TEST_FILES/test_R1.fastq.gz" ]] || die "test_R1.fastq.gz not found"
+        [[ -f "$TEST_FILES/test_R2.fastq.gz" ]] || die "test_R2.fastq.gz not found"
+        command -v bowtie2 >/dev/null 2>&1 || die "bowtie2 not in PATH (required for --test-files)"
+        command -v bowtie2-build >/dev/null 2>&1 || die "bowtie2-build not in PATH (required for --test-files)"
+    fi
 }
 
 now_seconds() {
@@ -193,6 +207,27 @@ prepare_inputs() {
     make_large_genome_and_coverage "$wd/genome" "$wd/large.cov" "$RECORDS"
 }
 
+prepare_test_files_inputs() {
+    local wd="$1"
+    local genome_dir="$wd/test_files"
+    mkdir -p "$genome_dir"
+    cp "$TEST_FILES/NC_010473.fa.gz" "$genome_dir/"
+    cp "$TEST_FILES/test_R1.fastq.gz" "$genome_dir/"
+    cp "$TEST_FILES/test_R2.fastq.gz" "$genome_dir/"
+
+    echo "Preparing copied test_files genome..."
+    (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" >/dev/null 2>"$wd/logs/genome_preparation.err")
+
+    echo "Aligning test_files paired-end FASTQs with Perl Bismark..."
+    (cd "$wd" && perl "$PERL_BIN/bismark" \
+        --genome "$genome_dir" \
+        -1 "$genome_dir/test_R1.fastq.gz" \
+        -2 "$genome_dir/test_R2.fastq.gz" \
+        >/dev/null 2>"$wd/logs/bismark_align.err")
+
+    [[ -f "$wd/test_R1_bismark_bt2_pe.bam" ]] || die "Expected Bismark BAM not found"
+}
+
 bench_extractor() {
     local wd="$1" run="$2"
     local perl_dir="$wd/run${run}/extractor/perl"
@@ -211,6 +246,26 @@ bench_extractor() {
         --single --no_header --mbias_off --comprehensive \
         --dir "$rust_dir" "$wd/large.sam")"
     append_result "bismark_methylation_extractor" "rust" "$run" "$t"
+}
+
+bench_test_files_extractor() {
+    local wd="$1" run="$2"
+    local perl_dir="$wd/run${run}/extractor/perl"
+    local rust_dir="$wd/run${run}/extractor/rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+
+    local t
+    t="$(time_command "$wd/logs/test_files_extractor_perl_$run" \
+        perl "$PERL_BIN/bismark_methylation_extractor" \
+        --paired --no_header --mbias_off --comprehensive \
+        --output "$perl_dir" "$wd/test_R1_bismark_bt2_pe.bam")"
+    append_result "test_files/bismark_methylation_extractor" "perl" "$run" "$t"
+
+    t="$(time_command "$wd/logs/test_files_extractor_rust_$run" \
+        "$RUST_BIN/bismark_methylation_extractor" \
+        --paired --no_header --mbias_off --comprehensive \
+        --dir "$rust_dir" "$wd/test_R1_bismark_bt2_pe.bam")"
+    append_result "test_files/bismark_methylation_extractor" "rust" "$run" "$t"
 }
 
 bench_dedup() {
@@ -235,6 +290,26 @@ bench_dedup() {
     append_result "deduplicate_bismark" "rust" "$run" "$t"
 }
 
+bench_test_files_dedup() {
+    local wd="$1" run="$2"
+    local perl_dir="$wd/run${run}/dedup/perl"
+    local rust_dir="$wd/run${run}/dedup/rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+    cp "$wd/test_R1_bismark_bt2_pe.bam" "$perl_dir/test.bam"
+    cp "$wd/test_R1_bismark_bt2_pe.bam" "$rust_dir/test.bam"
+
+    local t
+    t="$(time_command "$wd/logs/test_files_dedup_perl_$run" \
+        perl "$PERL_BIN/deduplicate_bismark" \
+        --paired --output_dir "$perl_dir" "$perl_dir/test.bam")"
+    append_result "test_files/deduplicate_bismark" "perl" "$run" "$t"
+
+    t="$(time_command "$wd/logs/test_files_dedup_rust_$run" \
+        "$RUST_BIN/deduplicate_bismark" \
+        --paired --output_dir "$rust_dir" "$rust_dir/test.bam")"
+    append_result "test_files/deduplicate_bismark" "rust" "$run" "$t"
+}
+
 bench_bedgraph() {
     local wd="$1" run="$2"
     local perl_dir="$wd/run${run}/bedgraph/perl"
@@ -253,6 +328,29 @@ bench_bedgraph() {
     append_result "bismark2bedGraph" "rust" "$run" "$t"
 }
 
+bench_test_files_bedgraph() {
+    local wd="$1" run="$2"
+    local extractor_dir="$wd/run${run}/extractor/rust"
+    local cpg_file
+    cpg_file="$(find "$extractor_dir" -maxdepth 1 -type f -name 'CpG_context_*.txt' | sort | head -1)"
+    [[ -n "$cpg_file" ]] || die "No test_files CpG extractor output found for bedGraph benchmark"
+
+    local perl_dir="$wd/run${run}/bedgraph/perl"
+    local rust_dir="$wd/run${run}/bedgraph/rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+
+    local t
+    t="$(time_command "$wd/logs/test_files_bedgraph_perl_$run" \
+        perl "$PERL_BIN/bismark2bedGraph" \
+        --output test_files.bedGraph --no_header --dir "$perl_dir" "$cpg_file")"
+    append_result "test_files/bismark2bedGraph" "perl" "$run" "$t"
+
+    t="$(time_command "$wd/logs/test_files_bedgraph_rust_$run" \
+        "$RUST_BIN/bismark2bedGraph" \
+        --output test_files.bedGraph --no_header --dir "$rust_dir" "$cpg_file")"
+    append_result "test_files/bismark2bedGraph" "rust" "$run" "$t"
+}
+
 bench_coverage2cytosine() {
     local wd="$1" run="$2"
     local perl_dir="$wd/run${run}/coverage2cytosine/perl"
@@ -269,6 +367,27 @@ bench_coverage2cytosine() {
         "$RUST_BIN/coverage2cytosine" \
         --genome_folder "$wd/genome" --output "$rust_dir/large.CpG_report.txt" "$wd/large.cov")"
     append_result "coverage2cytosine" "rust" "$run" "$t"
+}
+
+bench_test_files_coverage2cytosine() {
+    local wd="$1" run="$2"
+    local perl_dir="$wd/run${run}/coverage2cytosine/perl"
+    local rust_dir="$wd/run${run}/coverage2cytosine/rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+
+    local cov="$wd/run${run}/bedgraph/rust/test_files.bismark.cov.gz"
+    [[ -f "$cov" ]] || die "No test_files coverage file found for coverage2cytosine benchmark"
+
+    local t
+    t="$(time_command "$wd/logs/test_files_coverage2cytosine_perl_$run" \
+        perl "$PERL_BIN/coverage2cytosine" \
+        --genome_folder "$wd/test_files" --output "$perl_dir/test_files.CpG_report.txt" "$cov")"
+    append_result "test_files/coverage2cytosine" "perl" "$run" "$t"
+
+    t="$(time_command "$wd/logs/test_files_coverage2cytosine_rust_$run" \
+        "$RUST_BIN/coverage2cytosine" \
+        --genome_folder "$wd/test_files" --output "$rust_dir/test_files.CpG_report.txt" "$cov")"
+    append_result "test_files/coverage2cytosine" "rust" "$run" "$t"
 }
 
 print_summary() {
@@ -311,17 +430,29 @@ RESULTS="$WD/results.csv"
 mkdir -p "$WD/logs"
 printf "case,implementation,seconds,run\n" > "$RESULTS"
 
-echo "Preparing synthetic inputs ($RECORDS records)..."
-prepare_inputs "$WD"
+if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+    echo "Preparing test_files inputs..."
+    prepare_test_files_inputs "$WD"
+else
+    echo "Preparing synthetic inputs ($RECORDS records)..."
+    prepare_inputs "$WD"
+fi
 
 echo "Running $RUNS benchmark run(s)..."
 for run in $(seq 1 "$RUNS"); do
     echo ""
     echo "Run $run/$RUNS"
-    bench_extractor "$WD" "$run"
-    bench_dedup "$WD" "$run"
-    bench_bedgraph "$WD" "$run"
-    bench_coverage2cytosine "$WD" "$run"
+    if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+        bench_test_files_extractor "$WD" "$run"
+        bench_test_files_dedup "$WD" "$run"
+        bench_test_files_bedgraph "$WD" "$run"
+        bench_test_files_coverage2cytosine "$WD" "$run"
+    else
+        bench_extractor "$WD" "$run"
+        bench_dedup "$WD" "$run"
+        bench_bedgraph "$WD" "$run"
+        bench_coverage2cytosine "$WD" "$run"
+    fi
 done
 
 print_summary

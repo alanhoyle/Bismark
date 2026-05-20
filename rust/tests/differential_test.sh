@@ -3,7 +3,7 @@
 # on the same input, then diff every output file byte-for-byte.
 #
 # Usage:
-#   ./rust/tests/differential_test.sh [--keep]
+#   ./rust/tests/differential_test.sh [--keep] [--test-files]
 #
 # Requirements:
 #   - samtools in PATH
@@ -13,6 +13,9 @@
 #
 # Options:
 #   --keep   Keep temporary output directories on failure for inspection
+#   --test-files
+#            Use test_files/test_R1.fastq.gz and test_R2.fastq.gz by running
+#            Perl Bismark first, then compare downstream Perl/Rust tools.
 
 set -euo pipefail
 
@@ -23,7 +26,21 @@ PERL_BIN="$REPO_ROOT"
 TEST_FILES="$REPO_ROOT/test_files"
 
 KEEP=0
-for arg in "$@"; do [[ "$arg" == "--keep" ]] && KEEP=1; done
+USE_TEST_FILES=0
+for arg in "$@"; do
+    case "$arg" in
+        --keep) KEEP=1 ;;
+        --test-files) USE_TEST_FILES=1 ;;
+        -h|--help)
+            sed -n '1,16p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            exit 2
+            ;;
+    esac
+done
 
 PASS=0; FAIL=0
 
@@ -34,9 +51,15 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 check_prereq() {
     [[ -d "$TEST_FILES" ]] || die "test_files/ not found at $TEST_FILES"
     [[ -f "$TEST_FILES/NC_010473.fa.gz" ]] || die "NC_010473.fa.gz not found"
+    [[ -f "$TEST_FILES/test_R1.fastq.gz" ]] || die "test_R1.fastq.gz not found"
+    [[ -f "$TEST_FILES/test_R2.fastq.gz" ]] || die "test_R2.fastq.gz not found"
     command -v samtools >/dev/null 2>&1 || die "samtools not in PATH"
     [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
         || die "Rust binaries not built — run: cargo build --release --workspace"
+    if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+        command -v bowtie2 >/dev/null 2>&1 || die "bowtie2 not in PATH (required for --test-files)"
+        command -v bowtie2-build >/dev/null 2>&1 || die "bowtie2-build not in PATH (required for --test-files)"
+    fi
 }
 
 run_diff() {
@@ -101,6 +124,29 @@ run_diff_sorted() {
 make_workdir() {
     local d; d=$(mktemp -d)
     echo "$d"
+}
+
+prepare_test_files_alignment() {
+    local wd="$1"
+    local genome_dir="$wd/test_files"
+    mkdir -p "$genome_dir"
+    cp "$TEST_FILES/NC_010473.fa.gz" "$genome_dir/"
+    cp "$TEST_FILES/test_R1.fastq.gz" "$genome_dir/"
+    cp "$TEST_FILES/test_R2.fastq.gz" "$genome_dir/"
+
+    echo "  Preparing copied test_files genome..." >&2
+    (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" >/dev/null 2>"$wd/genome_preparation.err")
+
+    echo "  Aligning test_files paired-end FASTQs with Perl Bismark..." >&2
+    (cd "$wd" && perl "$PERL_BIN/bismark" \
+        --genome "$genome_dir" \
+        -1 "$genome_dir/test_R1.fastq.gz" \
+        -2 "$genome_dir/test_R2.fastq.gz" \
+        >/dev/null 2>"$wd/bismark_align.err")
+
+    local bam="$wd/test_R1_bismark_bt2_pe.bam"
+    [[ -f "$bam" ]] || die "Expected Bismark BAM not found at $bam"
+    echo "$bam"
 }
 
 cleanup() {
@@ -464,17 +510,81 @@ test_coverage2cytosine() {
     cleanup "$wd"
 }
 
+test_test_files_inputs() {
+    echo ""
+    echo "=== test_files FASTQ-derived downstream parity ==="
+
+    local wd; wd=$(make_workdir)
+    local bam
+    bam=$(prepare_test_files_alignment "$wd")
+
+    local perl_dir="$wd/extractor_perl" rust_dir="$wd/extractor_rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+    perl "$PERL_BIN/bismark_methylation_extractor" \
+        --paired --no_header --mbias_off --comprehensive \
+        --output "$perl_dir" "$bam" 2>/dev/null
+    "$RUST_BIN/bismark_methylation_extractor" \
+        --paired --no_header --mbias_off --comprehensive \
+        --dir "$rust_dir" "$bam" 2>/dev/null
+    compare_context_outputs "test_files/extractor" "$perl_dir" "$rust_dir"
+
+    perl_dir="$wd/dedup_perl"; rust_dir="$wd/dedup_rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+    cp "$bam" "$perl_dir/test.bam"
+    cp "$bam" "$rust_dir/test.bam"
+    perl "$PERL_BIN/deduplicate_bismark" \
+        --paired --output_dir "$perl_dir" "$perl_dir/test.bam" 2>/dev/null
+    "$RUST_BIN/deduplicate_bismark" \
+        --paired --output_dir "$rust_dir" "$rust_dir/test.bam" 2>/dev/null
+    local perl_rep rust_rep perl_bam rust_bam
+    perl_rep=$(find_one "$perl_dir" "*deduplication_report*")
+    rust_rep=$(find_one "$rust_dir" "*deduplication_report*")
+    run_diff_no_paths "test_files/dedup_report" "$perl_rep" "$rust_rep"
+    perl_bam=$(find_one "$perl_dir" "*deduplicated.bam")
+    rust_bam=$(find_one "$rust_dir" "*deduplicated.bam")
+    run_diff_sorted "test_files/dedup_bam" "$perl_bam" "$rust_bam"
+
+    perl_dir="$wd/bedgraph_perl"; rust_dir="$wd/bedgraph_rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+    perl "$PERL_BIN/bismark2bedGraph" \
+        --output test_files.bedGraph --no_header --dir "$perl_dir" \
+        "$(find_one "$wd/extractor_perl" "CpG_context_*.txt")" 2>/dev/null
+    "$RUST_BIN/bismark2bedGraph" \
+        --output test_files.bedGraph --no_header --dir "$rust_dir" \
+        "$(find_one "$wd/extractor_rust" "CpG_context_*.txt")" 2>/dev/null
+    run_diff_gz "test_files/bedGraph" "$perl_dir/test_files.bedGraph.gz" "$rust_dir/test_files.bedGraph.gz"
+    run_diff_gz "test_files/coverage" "$perl_dir/test_files.bismark.cov.gz" "$rust_dir/test_files.bismark.cov.gz"
+
+    perl_dir="$wd/cytosine_perl"; rust_dir="$wd/cytosine_rust"
+    mkdir -p "$perl_dir" "$rust_dir"
+    perl "$PERL_BIN/coverage2cytosine" \
+        --genome_folder "$wd/test_files" \
+        --output "$perl_dir/test_files.CpG_report.txt" \
+        "$perl_dir/../bedgraph_perl/test_files.bismark.cov.gz" 2>/dev/null
+    "$RUST_BIN/coverage2cytosine" \
+        --genome_folder "$wd/test_files" \
+        --output "$rust_dir/test_files.CpG_report.txt" \
+        "$rust_dir/../bedgraph_rust/test_files.bismark.cov.gz" 2>/dev/null
+    run_diff "test_files/CpG_report" "$perl_dir/test_files.CpG_report.txt" "$rust_dir/test_files.CpG_report.txt"
+
+    cleanup "$wd"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 check_prereq
 
-test_extractor
-test_extractor_strand_specific
-test_extractor_modes
-test_extractor_paired_overlap
-test_dedup
-test_bedgraph
-test_coverage2cytosine
+if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+    test_test_files_inputs
+else
+    test_extractor
+    test_extractor_strand_specific
+    test_extractor_modes
+    test_extractor_paired_overlap
+    test_dedup
+    test_bedgraph
+    test_coverage2cytosine
+fi
 
 echo ""
 echo "═══════════════════════════════════════"
