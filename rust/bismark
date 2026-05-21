@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+
 # Invoke the Perl bismark aligner with Rust downstream tools active.
 # Prepends rust/target/release/ to PATH so every downstream call
 # (bismark_methylation_extractor, deduplicate_bismark, etc.) uses the
 # Rust binaries automatically.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$SCRIPT_DIR/target/release:$PATH"
+
 exec perl "$SCRIPT_DIR/../bismark" "$@"
