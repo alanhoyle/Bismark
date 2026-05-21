@@ -62,6 +62,8 @@ RUN apt-get update \
         perl \
         samtools \
         bowtie2 \
+        hisat2 \
+        minimap2 \
  && rm -rf /var/lib/apt/lists/*
 
 # All tools live in /bismark:
