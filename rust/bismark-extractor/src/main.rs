@@ -689,15 +689,20 @@ fn new_buffer(no_header: bool) -> Result<OutputTarget> {
     Ok(w)
 }
 
-fn make_stem(filename: &str, output_dir: &str) -> String {
+/// Strip path components and the file extension, returning the bare base name.
+/// E.g. "/data/sample.bam" → "sample", "run.sam.gz" → "run".
+fn strip_ext(filename: &str) -> &str {
     let base = filename.split('/').last().unwrap_or(filename);
     let base = base.trim_end_matches(".gz");
-    let base = base
-        .trim_end_matches(".bam")
+    base.trim_end_matches(".bam")
         .trim_end_matches(".cram")
         .trim_end_matches(".sam")
-        .trim_end_matches(".txt");
-    format!("{}{}", output_dir, base)
+        .trim_end_matches(".txt")
+}
+
+/// Prepend output_dir to the bare base name to form the output path prefix.
+fn make_stem(filename: &str, output_dir: &str) -> String {
+    format!("{}{}", output_dir, strip_ext(filename))
 }
 
 fn open_outputs(stem: &str, mode: OutputMode, gzip: bool, no_header: bool) -> Result<OutputFiles> {
@@ -1056,12 +1061,13 @@ fn main() -> Result<()> {
     let mut first_bare_stem: Option<String> = None;
 
     for file in &cli.files.clone() {
+        let bare = strip_ext(file.to_str().unwrap_or("")).to_string();
         if first_bare_stem.is_none() {
-            first_bare_stem = Some(make_stem(file.to_str().unwrap_or(""), ""));
+            first_bare_stem = Some(bare.clone());
         }
         process_file(file, &cli, &samtools, &output_dir, mode)?;
         if cli.bedgraph {
-            let stem = make_stem(file.to_str().unwrap_or(""), &output_dir);
+            let stem = format!("{output_dir}{bare}");
             all_output_files.extend(collect_output_files(&stem, mode, cli.gzip));
         }
     }
@@ -1110,7 +1116,8 @@ fn process_file(
     }
     let no_overlap = is_paired && !cli.include_overlap;
 
-    let stem = make_stem(filename, output_dir);
+    let bare = strip_ext(filename);               // base name without path or extension
+    let stem = format!("{output_dir}{bare}");     // full output path prefix
     let mut out = open_outputs(&stem, mode, cli.gzip, cli.no_header)?;
     let mut mbias1: MbiasTable = HashMap::new();
     let mut mbias2: MbiasTable = HashMap::new();
@@ -1501,7 +1508,7 @@ fn write_mbias_report(
     mbias2: &MbiasTable,
     is_paired: bool,
 ) -> Result<()> {
-    let path = format!("{stem}M-bias.txt");
+    let path = format!("{stem}.M-bias.txt");
     let mut f = std::fs::File::create(&path).with_context(|| format!("creating {path}"))?;
 
     writeln!(f, "CpG context\tRead 1")?;
@@ -1768,27 +1775,34 @@ mod tests {
         assert_eq!(determine_strand(b"XX", b"YY"), None);
     }
 
+    // ─── strip_ext ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_ext_plain_bam() {
+        assert_eq!(strip_ext("sample.bam"), "sample");
+    }
+
+    #[test]
+    fn test_strip_ext_gzipped_sam() {
+        // .gz stripped first, then .sam — result is bare name
+        assert_eq!(strip_ext("sample.sam.gz"), "sample");
+    }
+
+    #[test]
+    fn test_strip_ext_path_component() {
+        assert_eq!(strip_ext("/data/run/sample.bam"), "sample");
+    }
+
     // ─── make_stem ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_make_stem_plain_bam() {
-        assert_eq!(make_stem("sample.bam", ""), "sample");
-    }
-
-    #[test]
-    fn test_make_stem_gzipped_sam() {
-        // .gz stripped first, then .sam — result is bare stem
-        assert_eq!(make_stem("sample.sam.gz", ""), "sample");
-    }
-
-    #[test]
-    fn test_make_stem_with_dir() {
+    fn test_make_stem_prepends_output_dir() {
         assert_eq!(make_stem("sample.bam", "/out/"), "/out/sample");
     }
 
     #[test]
-    fn test_make_stem_path_component() {
-        assert_eq!(make_stem("/data/run/sample.bam", ""), "sample");
+    fn test_make_stem_empty_dir() {
+        assert_eq!(make_stem("sample.bam", ""), "sample");
     }
 
     // ─── normalise_dir ───────────────────────────────────────────────────────
