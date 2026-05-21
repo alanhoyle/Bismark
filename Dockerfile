@@ -26,7 +26,7 @@
 # ── Stage 1: compile Rust downstream tools ────────────────────────────────────
 # TARGETPLATFORM is injected by buildx; the Rust toolchain cross-compiles
 # to the correct architecture automatically.
-FROM --platform=$BUILDPLATFORM rust:1.75-slim-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:slim-bookworm AS builder
 
 ARG TARGETPLATFORM
 ARG TARGETARCH

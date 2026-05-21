@@ -34,7 +34,7 @@ cargo build --release --workspace
 Binaries are written to `rust/target/release/`. Samtools must be available in
 `PATH` (or passed via `--samtools_path`) at runtime.
 
-**Minimum Rust version:** 1.75 (2021 edition)
+**Minimum Rust version:** current stable (2021 edition)
 
 ## Using the Rust tools alongside the Perl aligner
 
