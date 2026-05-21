@@ -1,9 +1,9 @@
 # Bismark — Rust port
 
 This directory contains a Rust reimplementation of the Bismark downstream
-processing tools. The Rust binaries are drop-in replacements for their Perl
-counterparts: they accept the same command-line flags and produce byte-identical
-output.
+processing tools based on **Bismark v0.25.1**. The Rust binaries are
+drop-in replacements for their Perl counterparts: they accept the same
+command-line flags and produce byte-identical output.
 
 The main Bismark aligner is not yet ported; alignment still uses the Perl
 `bismark` script backed by Bowtie2, HISAT2, or minimap2.
