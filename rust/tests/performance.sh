@@ -3,13 +3,24 @@
 # tools on synthetic inputs and report wall-clock timing summaries.
 #
 # Usage:
-#   ./rust/tests/performance.sh [--runs N] [--records N] [--threads N] [--keep] [--test-files]
+#   ./rust/tests/performance.sh [--runs N] [--records N] [--threads N]
+#                                [--mem] [--keep] [--test-files]
 #
 # Requirements:
 #   - samtools in PATH
 #   - Perl scripts at ../  (relative to rust/)
 #   - Rust binaries built: cargo build --release --workspace
 #   - bowtie2/bowtie2-build in PATH when using --test-files
+#
+# Options:
+#   --runs N      Number of benchmark repetitions [default: 3]
+#   --records N   Synthetic input size [default: 50000]
+#   --threads N   Thread count forwarded to tools that support it [default: 1]
+#   --mem         Track peak RSS memory usage via /usr/bin/time.
+#                 Prefers gtime (brew install gnu-time) on macOS for clean
+#                 stderr separation; falls back to /usr/bin/time -l otherwise.
+#   --keep        Keep temporary output directories on failure for inspection
+#   --test-files  Use test_files/ real data instead of synthetic inputs
 #
 # Notes:
 #   This is a lightweight benchmark harness, not a statistical benchmark suite.
@@ -27,6 +38,7 @@ RUNS=3
 RECORDS=50000
 THREADS=1
 KEEP=0
+MEASURE_MEM=0
 USE_TEST_FILES=0
 
 while [[ $# -gt 0 ]]; do
@@ -43,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             THREADS="${2:-}"
             shift 2
             ;;
+        --mem)
+            MEASURE_MEM=1
+            shift
+            ;;
         --keep)
             KEEP=1
             shift
@@ -52,7 +68,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '1,18p' "$0"
+            sed -n '1,20p' "$0"
             exit 0
             ;;
         *)
@@ -64,21 +80,63 @@ done
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
-check_prereq() {
-    [[ "$RUNS" =~ ^[0-9]+$ && "$RUNS" -gt 0 ]] || die "--runs must be a positive integer"
-    [[ "$RECORDS" =~ ^[0-9]+$ && "$RECORDS" -gt 0 ]] || die "--records must be a positive integer"
-    [[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -gt 0 ]] || die "--threads must be a positive integer"
-    command -v samtools >/dev/null 2>&1 || die "samtools not in PATH"
-    [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
-        || die "Rust binaries not built - run: cargo build --release --workspace"
-    if [[ "$USE_TEST_FILES" -eq 1 ]]; then
-        [[ -f "$TEST_FILES/NC_010473.fa.gz" ]] || die "NC_010473.fa.gz not found"
-        [[ -f "$TEST_FILES/test_R1.fastq.gz" ]] || die "test_R1.fastq.gz not found"
-        [[ -f "$TEST_FILES/test_R2.fastq.gz" ]] || die "test_R2.fastq.gz not found"
-        command -v bowtie2 >/dev/null 2>&1 || die "bowtie2 not in PATH (required for --test-files)"
-        command -v bowtie2-build >/dev/null 2>&1 || die "bowtie2-build not in PATH (required for --test-files)"
+# ─── Memory measurement setup ─────────────────────────────────────────────────
+# TIME_CMD / TIME_ARGS: the command used to wrap benchmarks when --mem is set.
+# TIME_MODE: "gnu" (gtime or Linux time -v) or "darwin" (/usr/bin/time -l).
+# TIME_SUPPORTS_OUTFILE: 1 when the -o flag is available to write time output
+#   to a separate file (keeps command stderr clean); 0 on macOS fallback.
+TIME_CMD=""
+TIME_ARGS=""
+TIME_MODE=""
+TIME_SUPPORTS_OUTFILE=0
+
+setup_time_cmd() {
+    if [[ "$MEASURE_MEM" -eq 0 ]]; then
+        return
+    fi
+    local platform
+    platform="$(uname -s)"
+    if command -v gtime >/dev/null 2>&1; then
+        TIME_CMD="gtime"
+        TIME_ARGS="-v"
+        TIME_MODE="gnu"
+        TIME_SUPPORTS_OUTFILE=1
+    elif [[ "$platform" == "Linux" ]]; then
+        TIME_CMD="/usr/bin/time"
+        TIME_ARGS="-v"
+        TIME_MODE="gnu"
+        TIME_SUPPORTS_OUTFILE=1
+    elif [[ "$platform" == "Darwin" ]]; then
+        TIME_CMD="/usr/bin/time"
+        TIME_ARGS="-l"
+        TIME_MODE="darwin"
+        TIME_SUPPORTS_OUTFILE=0
+        echo "Note: gtime not found; falling back to /usr/bin/time -l." \
+             "Command stderr and timing output will be mixed in .timemem files." \
+             "(Install: brew install gnu-time)" >&2
+    else
+        die "--mem: cannot find a supported time command (try: brew install gnu-time)"
     fi
 }
+
+# Extract peak RSS in bytes from a time output file.
+extract_rss() {
+    local timelog="$1"
+    [[ -f "$timelog" ]] || { echo 0; return; }
+    if [[ "$TIME_MODE" == "darwin" ]]; then
+        # /usr/bin/time -l line: "  32751616  maximum resident set size"
+        grep "maximum resident set size" "$timelog" \
+            | awk '{print $1}' | head -1 || echo 0
+    else
+        # gtime -v / time -v line: "Maximum resident set size (kbytes): 31984"
+        local kb
+        kb="$(grep "Maximum resident set size" "$timelog" \
+              | awk '{print $NF}' | head -1)" || true
+        echo "$(( ${kb:-0} * 1024 ))"
+    fi
+}
+
+# ─── Timing helpers ───────────────────────────────────────────────────────────
 
 now_seconds() {
     perl -MTime::HiRes=time -e 'printf "%.6f\n", time'
@@ -89,40 +147,96 @@ elapsed_seconds() {
     awk -v s="$start" -v e="$end" 'BEGIN { printf "%.6f", e - s }'
 }
 
+# Globals set by time_command; read by append_result in the same shell.
+# time_command must NOT be called inside $() — that creates a subshell and the
+# globals would be invisible to the caller.
+LAST_LOG_PREFIX=""
+LAST_ELAPSED="0"
+
 time_command() {
-    local log_prefix="$1"
-    shift
+    LAST_LOG_PREFIX="$1"; shift
     local start end
     start="$(now_seconds)"
-    "$@" >"${log_prefix}.out" 2>"${log_prefix}.err"
+    if [[ "$MEASURE_MEM" -eq 1 ]]; then
+        local timemem="${LAST_LOG_PREFIX}.timemem"
+        if [[ "$TIME_SUPPORTS_OUTFILE" -eq 1 ]]; then
+            # Write time stats to a separate file; command stderr goes to .err
+            "$TIME_CMD" $TIME_ARGS -o "$timemem" \
+                "$@" >"${LAST_LOG_PREFIX}.out" 2>"${LAST_LOG_PREFIX}.err"
+        else
+            # macOS fallback: command stderr and time stats both go to .timemem
+            "$TIME_CMD" $TIME_ARGS \
+                "$@" >"${LAST_LOG_PREFIX}.out" 2>"$timemem"
+        fi
+    else
+        "$@" >"${LAST_LOG_PREFIX}.out" 2>"${LAST_LOG_PREFIX}.err"
+    fi
     end="$(now_seconds)"
-    elapsed_seconds "$start" "$end"
+    LAST_ELAPSED="$(elapsed_seconds "$start" "$end")"
 }
+
+# ─── Statistics helpers ───────────────────────────────────────────────────────
 
 ratio() {
     local perl_time="$1" rust_time="$2"
     awk -v p="$perl_time" -v r="$rust_time" 'BEGIN {
-        if (r == 0) {
-            printf "inf"
-        } else {
-            printf "%.2fx", p / r
-        }
+        if (r == 0) { printf "inf" }
+        else { printf "%.2fx", p / r }
+    }'
+}
+
+mem_ratio() {
+    local perl_mem="$1" rust_mem="$2"
+    awk -v p="$perl_mem" -v r="$rust_mem" 'BEGIN {
+        if (r == 0) { printf "inf" }
+        else { printf "%.2fx", p / r }
     }'
 }
 
 mean_csv() {
     local csv="$1"
-    awk -F, '$3 ~ /^[0-9.]+$/ { sum += $3; n++ } END { if (n) printf "%.6f", sum / n; else printf "0.000000" }' "$csv"
+    awk -F, '$3 ~ /^[0-9.]+$/ { sum += $3; n++ } \
+             END { if (n) printf "%.6f", sum / n; else printf "0.000000" }' "$csv"
 }
 
 min_csv() {
     local csv="$1"
-    awk -F, '$3 ~ /^[0-9.]+$/ { if (n == 0 || $3 < min) min = $3; n++ } END { if (n) printf "%.6f", min; else printf "0.000000" }' "$csv"
+    awk -F, '$3 ~ /^[0-9.]+$/ { if (n == 0 || $3 < min) min = $3; n++ } \
+             END { if (n) printf "%.6f", min; else printf "0.000000" }' "$csv"
+}
+
+# Mean peak RSS across runs (column 5), in bytes.
+mean_rss_csv() {
+    local csv="$1"
+    awk -F, '$5 ~ /^[0-9]+$/ { sum += $5; n++ } \
+             END { if (n) printf "%.0f", sum / n; else printf "0" }' "$csv"
+}
+
+# Max peak RSS across runs (column 5), in bytes.
+max_rss_csv() {
+    local csv="$1"
+    awk -F, '$5 ~ /^[0-9]+$/ { if (n == 0 || $5 > max) max = $5; n++ } \
+             END { if (n) printf "%.0f", max; else printf "0" }' "$csv"
+}
+
+format_bytes() {
+    local bytes="$1"
+    awk -v b="$bytes" 'BEGIN {
+        if      (b >= 1073741824) printf "%.1f GiB", b / 1073741824
+        else if (b >= 1048576)    printf "%.1f MiB", b / 1048576
+        else if (b >= 1024)       printf "%.1f KiB", b / 1024
+        else                      printf "%d B",     b
+    }'
 }
 
 append_result() {
     local case_name="$1" impl="$2" run="$3" seconds="$4"
-    printf "%s,%s,%s,%s\n" "$case_name" "$impl" "$seconds" "$run" >> "$RESULTS"
+    local rss=0
+    if [[ "$MEASURE_MEM" -eq 1 ]]; then
+        rss="$(extract_rss "${LAST_LOG_PREFIX}.timemem")"
+        rss="${rss:-0}"
+    fi
+    printf "%s,%s,%s,%s,%s\n" "$case_name" "$impl" "$seconds" "$run" "$rss" >> "$RESULTS"
 }
 
 normalise_dir() {
@@ -142,6 +256,28 @@ cleanup() {
         echo "Kept working directory: $dir"
     fi
 }
+
+# ─── Prereq check ─────────────────────────────────────────────────────────────
+
+check_prereq() {
+    [[ "$RUNS"    =~ ^[0-9]+$ && "$RUNS"    -gt 0 ]] || die "--runs must be a positive integer"
+    [[ "$RECORDS" =~ ^[0-9]+$ && "$RECORDS" -gt 0 ]] || die "--records must be a positive integer"
+    [[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -gt 0 ]] || die "--threads must be a positive integer"
+    command -v samtools >/dev/null 2>&1 || die "samtools not in PATH"
+    [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
+        || die "Rust binaries not built - run: cargo build --release --workspace"
+    if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+        [[ -f "$TEST_FILES/NC_010473.fa.gz" ]] || die "NC_010473.fa.gz not found"
+        [[ -f "$TEST_FILES/test_R1.fastq.gz" ]] || die "test_R1.fastq.gz not found"
+        [[ -f "$TEST_FILES/test_R2.fastq.gz" ]] || die "test_R2.fastq.gz not found"
+        command -v bowtie2 >/dev/null 2>&1 \
+            || die "bowtie2 not in PATH (required for --test-files)"
+        command -v bowtie2-build >/dev/null 2>&1 \
+            || die "bowtie2-build not in PATH (required for --test-files)"
+    fi
+}
+
+# ─── Input generation ─────────────────────────────────────────────────────────
 
 make_fake_aligner_dir() {
     local wd="$1"
@@ -234,7 +370,8 @@ prepare_test_files_inputs() {
     cp "$TEST_FILES/test_R2.fastq.gz" "$genome_dir/"
 
     echo "Preparing copied test_files genome..."
-    (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" >/dev/null 2>"$wd/logs/genome_preparation.err")
+    (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" \
+        >/dev/null 2>"$wd/logs/genome_preparation.err")
 
     echo "Aligning test_files paired-end FASTQs with Perl Bismark..."
     (cd "$wd" && perl "$PERL_BIN/bismark" \
@@ -246,6 +383,8 @@ prepare_test_files_inputs() {
     [[ -f "$wd/test_R1_bismark_bt2_pe.bam" ]] || die "Expected Bismark BAM not found"
 }
 
+# ─── Benchmark functions ───────────────────────────────────────────────────────
+
 bench_genome_prep() {
     local wd="$1" run="$2"
     local fake_aligner="$3"
@@ -255,7 +394,6 @@ bench_genome_prep() {
     cp "$wd/genome/chr1.fa" "$perl_genome/chr1.fa"
     cp "$wd/genome/chr1.fa" "$rust_genome/chr1.fa"
 
-    local t
     local perl_cmd=(perl "$PERL_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
     local rust_cmd=("$RUST_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
     if [[ "$THREADS" -gt 1 ]]; then
@@ -263,13 +401,11 @@ bench_genome_prep() {
         rust_cmd+=(--parallel "$THREADS")
     fi
 
-    t="$(time_command "$wd/logs/genome_prep_perl_$run" \
-        "${perl_cmd[@]}" "$perl_genome")"
-    append_result "bismark_genome_preparation" "perl" "$run" "$t"
+    time_command "$wd/logs/genome_prep_perl_$run" "${perl_cmd[@]}" "$perl_genome"
+    append_result "bismark_genome_preparation" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/genome_prep_rust_$run" \
-        "${rust_cmd[@]}" "$rust_genome")"
-    append_result "bismark_genome_preparation" "rust" "$run" "$t"
+    time_command "$wd/logs/genome_prep_rust_$run" "${rust_cmd[@]}" "$rust_genome"
+    append_result "bismark_genome_preparation" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_test_files_genome_prep() {
@@ -281,7 +417,6 @@ bench_test_files_genome_prep() {
     cp "$TEST_FILES/NC_010473.fa.gz" "$perl_genome/"
     cp "$TEST_FILES/NC_010473.fa.gz" "$rust_genome/"
 
-    local t
     local perl_cmd=(perl "$PERL_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
     local rust_cmd=("$RUST_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
     if [[ "$THREADS" -gt 1 ]]; then
@@ -289,13 +424,11 @@ bench_test_files_genome_prep() {
         rust_cmd+=(--parallel "$THREADS")
     fi
 
-    t="$(time_command "$wd/logs/test_files_genome_prep_perl_$run" \
-        "${perl_cmd[@]}" "$perl_genome")"
-    append_result "test_files/bismark_genome_preparation" "perl" "$run" "$t"
+    time_command "$wd/logs/test_files_genome_prep_perl_$run" "${perl_cmd[@]}" "$perl_genome"
+    append_result "test_files/bismark_genome_preparation" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/test_files_genome_prep_rust_$run" \
-        "${rust_cmd[@]}" "$rust_genome")"
-    append_result "test_files/bismark_genome_preparation" "rust" "$run" "$t"
+    time_command "$wd/logs/test_files_genome_prep_rust_$run" "${rust_cmd[@]}" "$rust_genome"
+    append_result "test_files/bismark_genome_preparation" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_extractor() {
@@ -304,18 +437,17 @@ bench_extractor() {
     local rust_dir="$wd/run${run}/extractor/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
-    local t
-    t="$(time_command "$wd/logs/extractor_perl_$run" \
+    time_command "$wd/logs/extractor_perl_$run" \
         perl "$PERL_BIN/bismark_methylation_extractor" \
         --single --no_header --mbias_off --comprehensive --parallel "$THREADS" \
-        --output "$perl_dir" "$wd/large.sam")"
-    append_result "bismark_methylation_extractor" "perl" "$run" "$t"
+        --output "$perl_dir" "$wd/large.sam"
+    append_result "bismark_methylation_extractor" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/extractor_rust_$run" \
+    time_command "$wd/logs/extractor_rust_$run" \
         "$RUST_BIN/bismark_methylation_extractor" \
         --single --no_header --mbias_off --comprehensive --parallel "$THREADS" \
-        --dir "$rust_dir" "$wd/large.sam")"
-    append_result "bismark_methylation_extractor" "rust" "$run" "$t"
+        --dir "$rust_dir" "$wd/large.sam"
+    append_result "bismark_methylation_extractor" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_test_files_extractor() {
@@ -324,18 +456,17 @@ bench_test_files_extractor() {
     local rust_dir="$wd/run${run}/extractor/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
-    local t
-    t="$(time_command "$wd/logs/test_files_extractor_perl_$run" \
+    time_command "$wd/logs/test_files_extractor_perl_$run" \
         perl "$PERL_BIN/bismark_methylation_extractor" \
         --paired --no_header --mbias_off --comprehensive --parallel "$THREADS" \
-        --output "$perl_dir" "$wd/test_R1_bismark_bt2_pe.bam")"
-    append_result "test_files/bismark_methylation_extractor" "perl" "$run" "$t"
+        --output "$perl_dir" "$wd/test_R1_bismark_bt2_pe.bam"
+    append_result "test_files/bismark_methylation_extractor" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/test_files_extractor_rust_$run" \
+    time_command "$wd/logs/test_files_extractor_rust_$run" \
         "$RUST_BIN/bismark_methylation_extractor" \
         --paired --no_header --mbias_off --comprehensive --parallel "$THREADS" \
-        --dir "$rust_dir" "$wd/test_R1_bismark_bt2_pe.bam")"
-    append_result "test_files/bismark_methylation_extractor" "rust" "$run" "$t"
+        --dir "$rust_dir" "$wd/test_R1_bismark_bt2_pe.bam"
+    append_result "test_files/bismark_methylation_extractor" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_dedup() {
@@ -343,21 +474,20 @@ bench_dedup() {
     local perl_dir="$wd/run${run}/dedup/perl"
     local rust_dir="$wd/run${run}/dedup/rust"
     mkdir -p "$perl_dir" "$rust_dir"
-    cp "$wd/large.bam" "$perl_dir/large.bam"
+    cp "$wd/large.bam"     "$perl_dir/large.bam"
     cp "$wd/large.bam.bai" "$perl_dir/large.bam.bai"
-    cp "$wd/large.bam" "$rust_dir/large.bam"
+    cp "$wd/large.bam"     "$rust_dir/large.bam"
     cp "$wd/large.bam.bai" "$rust_dir/large.bam.bai"
 
-    local t
-    t="$(time_command "$wd/logs/dedup_perl_$run" \
+    time_command "$wd/logs/dedup_perl_$run" \
         perl "$PERL_BIN/deduplicate_bismark" \
-        --single --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/large.bam")"
-    append_result "deduplicate_bismark" "perl" "$run" "$t"
+        --single --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/large.bam"
+    append_result "deduplicate_bismark" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/dedup_rust_$run" \
+    time_command "$wd/logs/dedup_rust_$run" \
         "$RUST_BIN/deduplicate_bismark" \
-        --single --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/large.bam")"
-    append_result "deduplicate_bismark" "rust" "$run" "$t"
+        --single --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/large.bam"
+    append_result "deduplicate_bismark" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_test_files_dedup() {
@@ -368,16 +498,15 @@ bench_test_files_dedup() {
     cp "$wd/test_R1_bismark_bt2_pe.bam" "$perl_dir/test.bam"
     cp "$wd/test_R1_bismark_bt2_pe.bam" "$rust_dir/test.bam"
 
-    local t
-    t="$(time_command "$wd/logs/test_files_dedup_perl_$run" \
+    time_command "$wd/logs/test_files_dedup_perl_$run" \
         perl "$PERL_BIN/deduplicate_bismark" \
-        --paired --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/test.bam")"
-    append_result "test_files/deduplicate_bismark" "perl" "$run" "$t"
+        --paired --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/test.bam"
+    append_result "test_files/deduplicate_bismark" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/test_files_dedup_rust_$run" \
+    time_command "$wd/logs/test_files_dedup_rust_$run" \
         "$RUST_BIN/deduplicate_bismark" \
-        --paired --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/test.bam")"
-    append_result "test_files/deduplicate_bismark" "rust" "$run" "$t"
+        --paired --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/test.bam"
+    append_result "test_files/deduplicate_bismark" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_bedgraph() {
@@ -386,16 +515,15 @@ bench_bedgraph() {
     local rust_dir="$wd/run${run}/bedgraph/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
-    local t
-    t="$(time_command "$wd/logs/bedgraph_perl_$run" \
+    time_command "$wd/logs/bedgraph_perl_$run" \
         perl "$PERL_BIN/bismark2bedGraph" \
-        --output large.bedGraph --no_header --dir "$perl_dir" "$wd/CpG_OT_large.txt")"
-    append_result "bismark2bedGraph" "perl" "$run" "$t"
+        --output large.bedGraph --no_header --dir "$perl_dir" "$wd/CpG_OT_large.txt"
+    append_result "bismark2bedGraph" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/bedgraph_rust_$run" \
+    time_command "$wd/logs/bedgraph_rust_$run" \
         "$RUST_BIN/bismark2bedGraph" \
-        --output large.bedGraph --no_header --dir "$rust_dir" "$wd/CpG_OT_large.txt")"
-    append_result "bismark2bedGraph" "rust" "$run" "$t"
+        --output large.bedGraph --no_header --dir "$rust_dir" "$wd/CpG_OT_large.txt"
+    append_result "bismark2bedGraph" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_test_files_bedgraph() {
@@ -409,16 +537,15 @@ bench_test_files_bedgraph() {
     local rust_dir="$wd/run${run}/bedgraph/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
-    local t
-    t="$(time_command "$wd/logs/test_files_bedgraph_perl_$run" \
+    time_command "$wd/logs/test_files_bedgraph_perl_$run" \
         perl "$PERL_BIN/bismark2bedGraph" \
-        --output test_files.bedGraph --no_header --dir "$perl_dir" "$cpg_file")"
-    append_result "test_files/bismark2bedGraph" "perl" "$run" "$t"
+        --output test_files.bedGraph --no_header --dir "$perl_dir" "$cpg_file"
+    append_result "test_files/bismark2bedGraph" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/test_files_bedgraph_rust_$run" \
+    time_command "$wd/logs/test_files_bedgraph_rust_$run" \
         "$RUST_BIN/bismark2bedGraph" \
-        --output test_files.bedGraph --no_header --dir "$rust_dir" "$cpg_file")"
-    append_result "test_files/bismark2bedGraph" "rust" "$run" "$t"
+        --output test_files.bedGraph --no_header --dir "$rust_dir" "$cpg_file"
+    append_result "test_files/bismark2bedGraph" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_coverage2cytosine() {
@@ -427,16 +554,17 @@ bench_coverage2cytosine() {
     local rust_dir="$wd/run${run}/coverage2cytosine/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
-    local t
-    t="$(time_command "$wd/logs/coverage2cytosine_perl_$run" \
+    time_command "$wd/logs/coverage2cytosine_perl_$run" \
         perl "$PERL_BIN/coverage2cytosine" \
-        --genome_folder "$wd/genome" --output "$perl_dir/large.CpG_report.txt" "$wd/large.cov")"
-    append_result "coverage2cytosine" "perl" "$run" "$t"
+        --genome_folder "$wd/genome" \
+        --output "$perl_dir/large.CpG_report.txt" "$wd/large.cov"
+    append_result "coverage2cytosine" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/coverage2cytosine_rust_$run" \
+    time_command "$wd/logs/coverage2cytosine_rust_$run" \
         "$RUST_BIN/coverage2cytosine" \
-        --genome_folder "$wd/genome" --output "$rust_dir/large.CpG_report.txt" "$wd/large.cov")"
-    append_result "coverage2cytosine" "rust" "$run" "$t"
+        --genome_folder "$wd/genome" \
+        --output "$rust_dir/large.CpG_report.txt" "$wd/large.cov"
+    append_result "coverage2cytosine" "rust" "$run" "$LAST_ELAPSED"
 }
 
 bench_test_files_coverage2cytosine() {
@@ -448,59 +576,111 @@ bench_test_files_coverage2cytosine() {
     local cov="$wd/run${run}/bedgraph/rust/test_files.bismark.cov.gz"
     [[ -f "$cov" ]] || die "No test_files coverage file found for coverage2cytosine benchmark"
 
-    local t
-    t="$(time_command "$wd/logs/test_files_coverage2cytosine_perl_$run" \
+    time_command "$wd/logs/test_files_coverage2cytosine_perl_$run" \
         perl "$PERL_BIN/coverage2cytosine" \
-        --genome_folder "$wd/test_files" --output "$perl_dir/test_files.CpG_report.txt" "$cov")"
-    append_result "test_files/coverage2cytosine" "perl" "$run" "$t"
+        --genome_folder "$wd/test_files" \
+        --output "$perl_dir/test_files.CpG_report.txt" "$cov"
+    append_result "test_files/coverage2cytosine" "perl" "$run" "$LAST_ELAPSED"
 
-    t="$(time_command "$wd/logs/test_files_coverage2cytosine_rust_$run" \
+    time_command "$wd/logs/test_files_coverage2cytosine_rust_$run" \
         "$RUST_BIN/coverage2cytosine" \
-        --genome_folder "$wd/test_files" --output "$rust_dir/test_files.CpG_report.txt" "$cov")"
-    append_result "test_files/coverage2cytosine" "rust" "$run" "$t"
+        --genome_folder "$wd/test_files" \
+        --output "$rust_dir/test_files.CpG_report.txt" "$cov"
+    append_result "test_files/coverage2cytosine" "rust" "$run" "$LAST_ELAPSED"
 }
+
+# ─── Summary ──────────────────────────────────────────────────────────────────
 
 print_summary() {
     local cases
-    cases="$(awk -F, 'NR > 1 { seen[$1] = 1 } END { for (c in seen) print c }' "$RESULTS" | sort)"
+    cases="$(awk -F, 'NR > 1 { seen[$1] = 1 } END { for (c in seen) print c }' \
+             "$RESULTS" | sort)"
     local case_width
-    case_width="$(awk -F, 'NR > 1 { if (length($1) > max) max = length($1) } END { print (max > 4 ? max : 4) }' "$RESULTS")"
+    case_width="$(awk -F, 'NR > 1 { if (length($1) > max) max = length($1) } \
+                            END { print (max > 4 ? max : 4) }' "$RESULTS")"
 
     echo ""
-    echo "Performance summary (seconds; lower is better)"
-    printf "%-*s  %10s  %10s  %10s  %10s  %10s\n" "$case_width" "case" "perl avg" "rust avg" "speedup" "perl min" "rust min"
-    printf "%-*s  %10s  %10s  %10s  %10s  %10s\n" "$case_width" "----" "--------" "--------" "-------" "--------" "--------"
+    if [[ "$MEASURE_MEM" -eq 1 ]]; then
+        echo "Performance + memory summary (wall-clock seconds; peak RSS averaged across runs)"
+        printf "%-*s  %10s  %10s  %10s  %12s  %12s  %9s\n" \
+            "$case_width" "case" \
+            "perl avg" "rust avg" "speedup" \
+            "perl RAM" "rust RAM" "RAM ratio"
+        printf "%-*s  %10s  %10s  %10s  %12s  %12s  %9s\n" \
+            "$case_width" "----" \
+            "--------" "--------" "-------" \
+            "--------" "--------" "---------"
+    else
+        echo "Performance summary (wall-clock seconds; lower is better)"
+        printf "%-*s  %10s  %10s  %10s  %10s  %10s\n" \
+            "$case_width" "case" \
+            "perl avg" "rust avg" "speedup" "perl min" "rust min"
+        printf "%-*s  %10s  %10s  %10s  %10s  %10s\n" \
+            "$case_width" "----" \
+            "--------" "--------" "-------" "--------" "--------"
+    fi
 
     while IFS= read -r case_name; do
         [[ -n "$case_name" ]] || continue
-        local perl_csv rust_csv perl_avg rust_avg perl_min rust_min
+        local perl_csv rust_csv
         perl_csv="$(mktemp)"
         rust_csv="$(mktemp)"
-        awk -F, -v c="$case_name" '$1 == c && $2 == "perl" { print $0 }' "$RESULTS" > "$perl_csv"
-        awk -F, -v c="$case_name" '$1 == c && $2 == "rust" { print $0 }' "$RESULTS" > "$rust_csv"
+        awk -F, -v c="$case_name" '$1 == c && $2 == "perl" { print $0 }' \
+            "$RESULTS" > "$perl_csv"
+        awk -F, -v c="$case_name" '$1 == c && $2 == "rust" { print $0 }' \
+            "$RESULTS" > "$rust_csv"
+
+        local perl_avg rust_avg
         perl_avg="$(mean_csv "$perl_csv")"
         rust_avg="$(mean_csv "$rust_csv")"
-        perl_min="$(min_csv "$perl_csv")"
-        rust_min="$(min_csv "$rust_csv")"
-        printf "%-*s  %10.3f  %10.3f  %10s  %10.3f  %10.3f\n" \
-            "$case_width" "$case_name" "$perl_avg" "$rust_avg" "$(ratio "$perl_avg" "$rust_avg")" "$perl_min" "$rust_min"
+
+        if [[ "$MEASURE_MEM" -eq 1 ]]; then
+            local perl_rss rust_rss
+            perl_rss="$(mean_rss_csv "$perl_csv")"
+            rust_rss="$(mean_rss_csv "$rust_csv")"
+            printf "%-*s  %10.3f  %10.3f  %10s  %12s  %12s  %9s\n" \
+                "$case_width" "$case_name" \
+                "$perl_avg" "$rust_avg" \
+                "$(ratio "$perl_avg" "$rust_avg")" \
+                "$(format_bytes "$perl_rss")" \
+                "$(format_bytes "$rust_rss")" \
+                "$(mem_ratio "$perl_rss" "$rust_rss")"
+        else
+            local perl_min rust_min
+            perl_min="$(min_csv "$perl_csv")"
+            rust_min="$(min_csv "$rust_csv")"
+            printf "%-*s  %10.3f  %10.3f  %10s  %10.3f  %10.3f\n" \
+                "$case_width" "$case_name" \
+                "$perl_avg" "$rust_avg" \
+                "$(ratio "$perl_avg" "$rust_avg")" \
+                "$perl_min" "$rust_min"
+        fi
         rm -f "$perl_csv" "$rust_csv"
     done <<< "$cases"
 
     echo ""
     if [[ "$KEEP" -eq 1 ]]; then
-        echo "Raw timings: $RESULTS"
+        echo "Raw results: $RESULTS"
     else
-        echo "Raw timings are kept only with --keep."
+        echo "Raw results are kept only with --keep."
+    fi
+    if [[ "$MEASURE_MEM" -eq 1 ]]; then
+        echo "RAM figures are mean peak RSS across $RUNS run(s)."
+        if [[ "$TIME_SUPPORTS_OUTFILE" -eq 0 ]]; then
+            echo "Note: command stderr was merged with timing output (gtime not available)."
+        fi
     fi
 }
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 check_prereq
+setup_time_cmd
 
 WD="$(make_workdir)"
 RESULTS="$WD/results.csv"
 mkdir -p "$WD/logs"
-printf "case,implementation,seconds,run\n" > "$RESULTS"
+printf "case,implementation,seconds,run,rss_bytes\n" > "$RESULTS"
 FAKE_ALIGNER="$(make_fake_aligner_dir "$WD")"
 
 if [[ "$USE_TEST_FILES" -eq 1 ]]; then
@@ -511,21 +691,24 @@ else
     prepare_inputs "$WD"
 fi
 
-echo "Running $RUNS benchmark run(s) with $THREADS thread(s) where supported..."
+MEM_MSG=""
+[[ "$MEASURE_MEM" -eq 1 ]] && MEM_MSG=" with RAM tracking (${TIME_CMD} ${TIME_ARGS})"
+echo "Running $RUNS benchmark run(s) with $THREADS thread(s) where supported${MEM_MSG}..."
+
 for run in $(seq 1 "$RUNS"); do
     echo ""
     echo "Run $run/$RUNS"
     if [[ "$USE_TEST_FILES" -eq 1 ]]; then
         bench_test_files_genome_prep "$WD" "$run" "$FAKE_ALIGNER"
-        bench_test_files_extractor "$WD" "$run"
-        bench_test_files_dedup "$WD" "$run"
-        bench_test_files_bedgraph "$WD" "$run"
+        bench_test_files_extractor   "$WD" "$run"
+        bench_test_files_dedup       "$WD" "$run"
+        bench_test_files_bedgraph    "$WD" "$run"
         bench_test_files_coverage2cytosine "$WD" "$run"
     else
-        bench_genome_prep "$WD" "$run" "$FAKE_ALIGNER"
-        bench_extractor "$WD" "$run"
-        bench_dedup "$WD" "$run"
-        bench_bedgraph "$WD" "$run"
+        bench_genome_prep      "$WD" "$run" "$FAKE_ALIGNER"
+        bench_extractor        "$WD" "$run"
+        bench_dedup            "$WD" "$run"
+        bench_bedgraph         "$WD" "$run"
         bench_coverage2cytosine "$WD" "$run"
     fi
 done

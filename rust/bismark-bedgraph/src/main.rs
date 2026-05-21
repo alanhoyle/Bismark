@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -45,15 +45,16 @@ struct Cli {
     #[arg(long = "CX", alias = "CX_context")]
     cx_context: bool,
 
-    /// Sort buffer size for Unix sort (ignored; Rust sorts in memory)
-    #[arg(long = "buffer_size", default_value = "2G")]
-    buffer_size: String,
+    /// Enable disk-based external merge sort; value sets the in-memory run size
+    /// (e.g. 2G, 500M).  Omit to sort entirely in memory (default).
+    #[arg(long = "buffer_size")]
+    buffer_size: Option<String>,
 
-    /// Input has many scaffolds — sort globally (accepted, no effect in Rust)
+    /// Input has many scaffolds (accepted for compatibility; external sort handles this natively)
     #[arg(long = "gazillion", alias = "scaffolds")]
     gazillion: bool,
 
-    /// Use array-based (ample memory) sorting (accepted, no effect in Rust)
+    /// Sort in memory — the default; accepted for Perl compatibility
     #[arg(long = "ample_memory")]
     ample_memory: bool,
 
@@ -68,6 +69,139 @@ struct Cli {
     /// Print version and exit
     #[arg(long = "version")]
     version: bool,
+}
+
+// ─── External merge sort helpers ─────────────────────────────────────────────
+
+/// Parse a size string like "2G", "500M", "1024K", or a plain byte count.
+fn parse_buffer_size(s: &str) -> u64 {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix(['G', 'g']) {
+        (n, 1u64 << 30)
+    } else if let Some(n) = s.strip_suffix(['M', 'm']) {
+        (n, 1u64 << 20)
+    } else if let Some(n) = s.strip_suffix(['K', 'k']) {
+        (n, 1u64 << 10)
+    } else {
+        (s, 1u64)
+    };
+    num.parse::<u64>().unwrap_or(2 << 30) * mult
+}
+
+/// Sort `buf` by (chr, pos) and flush it as a tab-delimited temp file.
+/// The buffer is cleared on return.
+fn flush_sorted_run(
+    buf: &mut Vec<(String, u32, bool)>,
+    temp_files: &mut Vec<tempfile::NamedTempFile>,
+) -> Result<()> {
+    buf.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut tf = tempfile::NamedTempFile::new().context("creating temp file")?;
+    for (chr, pos, is_meth) in buf.drain(..) {
+        writeln!(tf, "{chr}\t{pos}\t{}", is_meth as u8)?;
+    }
+    tf.flush()?;
+    temp_files.push(tf);
+    Ok(())
+}
+
+/// Parse one line from a sorted-run temp file: "chr\tpos\t0_or_1".
+fn parse_temp_line(line: &str) -> Option<(String, u32, bool)> {
+    let mut f = line.splitn(3, '\t');
+    let chr = f.next()?.to_string();
+    let pos: u32 = f.next()?.parse().ok()?;
+    let is_meth = f.next()?.trim() == "1";
+    Some((chr, pos, is_meth))
+}
+
+/// Write one aggregated cytosine record to all active output writers.
+fn emit_record(
+    chr: &str,
+    pos: u32,
+    meth: u32,
+    unmeth: u32,
+    cutoff: u32,
+    bg_out: &mut dyn Write,
+    cov_out: &mut dyn Write,
+    zero_out: &mut Option<std::fs::File>,
+) -> Result<()> {
+    let total = meth + unmeth;
+    if total < cutoff {
+        return Ok(());
+    }
+    let pct = format_percentage(meth, total);
+    let bed_pos = pos - 1;
+    writeln!(bg_out, "{chr}\t{bed_pos}\t{pos}\t{pct}")?;
+    writeln!(cov_out, "{chr}\t{pos}\t{pos}\t{pct}\t{meth}\t{unmeth}")?;
+    if let Some(ref mut zf) = zero_out {
+        writeln!(zf, "{chr}\t{bed_pos}\t{pos}\t{pct}\t{meth}\t{unmeth}")?;
+    }
+    Ok(())
+}
+
+/// K-way merge of sorted temp files, aggregating same-position records,
+/// writing directly to the output writers.
+fn merge_and_write(
+    temp_files: Vec<tempfile::NamedTempFile>,
+    cutoff: u32,
+    bg_out: &mut dyn Write,
+    cov_out: &mut dyn Write,
+    zero_out: &mut Option<std::fs::File>,
+) -> Result<()> {
+    // Open a fresh read handle for each temp file.
+    let mut readers: Vec<std::io::Lines<BufReader<std::fs::File>>> = temp_files
+        .iter()
+        .map(|tf| {
+            let f = std::fs::File::open(tf.path())
+                .with_context(|| format!("reopening temp file {}", tf.path().display()))?;
+            Ok(BufReader::new(f).lines())
+        })
+        .collect::<Result<_>>()?;
+
+    // Min-heap entries: Reverse so BinaryHeap (max) behaves as a min-heap.
+    // Tuple: (chr, pos, is_meth_u8, file_idx)
+    let mut heap: BinaryHeap<std::cmp::Reverse<(String, u32, u8, usize)>> = BinaryHeap::new();
+
+    // Seed one record from each file.
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(Ok(line)) = reader.next() {
+            if let Some((chr, pos, is_meth)) = parse_temp_line(&line) {
+                heap.push(std::cmp::Reverse((chr, pos, is_meth as u8, i)));
+            }
+        }
+    }
+
+    let mut cur_chr = String::new();
+    let mut cur_pos: u32 = 0;
+    let mut meth: u32 = 0;
+    let mut unmeth: u32 = 0;
+    let mut started = false;
+
+    while let Some(std::cmp::Reverse((chr, pos, is_meth_u8, file_idx))) = heap.pop() {
+        // New position: emit the accumulated record for the previous position.
+        if started && (chr != cur_chr || pos != cur_pos) {
+            emit_record(&cur_chr, cur_pos, meth, unmeth, cutoff, bg_out, cov_out, zero_out)?;
+            meth = 0;
+            unmeth = 0;
+        }
+        cur_chr = chr;
+        cur_pos = pos;
+        started = true;
+        if is_meth_u8 == 1 { meth += 1; } else { unmeth += 1; }
+
+        // Advance this file and push its next record.
+        if let Some(Ok(line)) = readers[file_idx].next() {
+            if let Some((chr2, pos2, is_meth2)) = parse_temp_line(&line) {
+                heap.push(std::cmp::Reverse((chr2, pos2, is_meth2 as u8, file_idx)));
+            }
+        }
+    }
+
+    // Emit the final accumulated record.
+    if started {
+        emit_record(&cur_chr, cur_pos, meth, unmeth, cutoff, bg_out, cov_out, zero_out)?;
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -127,9 +261,11 @@ fn main() -> Result<()> {
     eprintln!("remove whitespaces:\t\t{}", if cli.remove_spaces { "yes" } else { "no" });
     eprintln!("CX context:\t\t\t{}", if cli.cx_context { "yes" } else { "no (CpG context only, default)" });
     eprintln!("No-header selected:\t\t{}", if cli.no_header { "yes" } else { "no" });
-    eprintln!("Sorting method:\t\t\t{}", if cli.ample_memory { "Array-based (faster, but larger memory footprint)" } else { "in-memory sort (Rust)" });
-    if !cli.ample_memory {
-        eprintln!("Sort buffer size:\t\t{}", cli.buffer_size);
+    if let Some(ref bs) = cli.buffer_size {
+        eprintln!("Sorting method:\t\t\texternal merge sort (disk-based)");
+        eprintln!("Sort buffer size:\t\t{bs}");
+    } else {
+        eprintln!("Sorting method:\t\t\tin-memory sort (default)");
     }
     eprintln!("Coverage threshold:\t\t{}", cli.cutoff);
     eprintln!("{}", "=".repeat(77));
@@ -169,14 +305,6 @@ fn main() -> Result<()> {
         eprintln!("- changes 'MT' to 'chrM'\n");
     }
 
-    // chr → Vec<(pos, is_meth)>
-    let mut data: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
-
-    for infile in &input_files {
-        read_methylation_file(infile, &cli, &mut data)
-            .with_context(|| format!("reading {}", infile.display()))?;
-    }
-
     let bedgraph_path = format!("{}{}", output_dir, bedgraph_name);
     let coverage_path = format!("{}{}", output_dir, coverage_name);
 
@@ -200,39 +328,59 @@ fn main() -> Result<()> {
     // Write bedGraph track header
     writeln!(bg_out, "track type=bedGraph")?;
 
-    // For each chromosome (BTreeMap gives lexicographic order), sort by pos and emit
-    for (chr, mut positions) in data {
-        positions.sort_unstable_by_key(|&(pos, _)| pos);
+    if let Some(ref buf_size_str) = cli.buffer_size {
+        // ── External merge sort path ─────────────────────────────────────────
+        let buffer_bytes = parse_buffer_size(buf_size_str);
+        eprintln!("External sort enabled; in-memory run size: {buf_size_str} ({buffer_bytes} bytes)");
 
-        let mut i = 0;
-        while i < positions.len() {
-            let pos = positions[i].0;
-            let mut meth: u32 = 0;
-            let mut unmeth: u32 = 0;
+        let mut buf: Vec<(String, u32, bool)> = Vec::new();
+        let mut buf_est: u64 = 0;
+        let mut temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
 
-            while i < positions.len() && positions[i].0 == pos {
-                if positions[i].1 {
-                    meth += 1;
-                } else {
-                    unmeth += 1;
+        for infile in &input_files {
+            // Re-use read_methylation_file but accumulate into a flat buffer
+            // by temporarily wrapping with a BTreeMap shim.
+            let mut shard: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+            read_methylation_file(infile, &cli, &mut shard)
+                .with_context(|| format!("reading {}", infile.display()))?;
+            for (chr, positions) in shard {
+                for (pos, is_meth) in positions {
+                    buf_est += chr.len() as u64 + 16;
+                    buf.push((chr.clone(), pos, is_meth));
                 }
-                i += 1;
+                if buf_est >= buffer_bytes {
+                    flush_sorted_run(&mut buf, &mut temp_files)?;
+                    buf_est = 0;
+                }
             }
+        }
+        if !buf.is_empty() {
+            flush_sorted_run(&mut buf, &mut temp_files)?;
+        }
 
-            let total = meth + unmeth;
-            if total < cli.cutoff {
-                continue;
-            }
+        eprintln!("Merging {} sorted run(s)…", temp_files.len());
+        merge_and_write(temp_files, cli.cutoff, &mut bg_out, &mut cov_out, &mut zero_out)?;
+    } else {
+        // ── In-memory sort path (default) ────────────────────────────────────
+        let mut data: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
+        for infile in &input_files {
+            read_methylation_file(infile, &cli, &mut data)
+                .with_context(|| format!("reading {}", infile.display()))?;
+        }
 
-            let pct = format_percentage(meth, total);
-            let bed_pos = pos - 1; // 0-based start
-            let one_based = pos;   // 1-based end / position
+        for (chr, mut positions) in data {
+            positions.sort_unstable_by_key(|&(pos, _)| pos);
 
-            writeln!(bg_out, "{chr}\t{bed_pos}\t{one_based}\t{pct}")?;
-            writeln!(cov_out, "{chr}\t{one_based}\t{one_based}\t{pct}\t{meth}\t{unmeth}")?;
-
-            if let Some(ref mut zf) = zero_out {
-                writeln!(zf, "{chr}\t{bed_pos}\t{one_based}\t{pct}\t{meth}\t{unmeth}")?;
+            let mut i = 0;
+            while i < positions.len() {
+                let pos = positions[i].0;
+                let mut meth: u32 = 0;
+                let mut unmeth: u32 = 0;
+                while i < positions.len() && positions[i].0 == pos {
+                    if positions[i].1 { meth += 1; } else { unmeth += 1; }
+                    i += 1;
+                }
+                emit_record(&chr, pos, meth, unmeth, cli.cutoff, &mut bg_out, &mut cov_out, &mut zero_out)?;
             }
         }
     }

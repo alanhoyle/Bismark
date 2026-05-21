@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -6,6 +6,31 @@ use bismark_lib::bam_io::{bam_is_truncated, find_samtools, BamReader, BamWriter}
 use bismark_lib::BISMARK_VERSION;
 use clap::Parser;
 use rustc_hash::{FxHashMap, FxHashSet};
+
+enum OutputWriter {
+    Bam(BamWriter),
+    Sam(BufWriter<std::fs::File>),
+}
+
+impl OutputWriter {
+    fn write_line(&mut self, line: &[u8]) -> anyhow::Result<()> {
+        match self {
+            OutputWriter::Bam(w) => w.write_line(line),
+            OutputWriter::Sam(w) => {
+                w.write_all(line)?;
+                w.write_all(b"\n")?;
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        match self {
+            OutputWriter::Bam(w) => w.finish(),
+            OutputWriter::Sam(mut w) => Ok(w.flush()?),
+        }
+    }
+}
 
 /// Dedup key for single-end reads: (strand_index, chr_interned, key_pos)
 /// For OT/CTOB (forward): key_pos = POS (start)
@@ -62,6 +87,18 @@ struct Cli {
     #[arg(long = "parallel", default_value_t = 1)]
     parallel: u32,
 
+    /// Output as BAM (default; accepted for compatibility)
+    #[arg(long = "bam")]
+    bam: bool,
+
+    /// Output as SAM instead of BAM
+    #[arg(long = "sam")]
+    sam: bool,
+
+    /// [removed upstream] Exits with an error
+    #[arg(long = "representative")]
+    representative: bool,
+
     /// Print version and exit
     #[arg(long = "version")]
     version: bool,
@@ -76,6 +113,14 @@ fn main() -> Result<()> {
             BISMARK_VERSION, "2010-25 Felix Krueger, Altos Bioinformatics"
         );
         return Ok(());
+    }
+
+    if cli.representative {
+        bail!("Deduplication in '--representative' mode is no longer supported. Please stop wanting that.");
+    }
+
+    if cli.bam && cli.sam {
+        bail!("Please specify either --bam or --sam, not both");
     }
 
     if cli.single && cli.paired {
@@ -119,6 +164,7 @@ fn main() -> Result<()> {
                 cli.outfile.as_deref(),
                 &samtools,
                 cli.parallel,
+                cli.sam,
             )?;
         }
     } else {
@@ -134,6 +180,7 @@ fn main() -> Result<()> {
                 cli.outfile.as_deref(),
                 &samtools,
                 cli.parallel,
+                cli.sam,
             )?;
         }
     }
@@ -152,6 +199,7 @@ fn deduplicate_files(
     user_outfile: Option<&str>,
     samtools: &str,
     parallel: u32,
+    sam_mode: bool,
 ) -> Result<()> {
     let primary = &files[0];
 
@@ -186,24 +234,31 @@ fn deduplicate_files(
     let mut report = std::fs::File::create(&report_path)
         .with_context(|| format!("failed to create {report_path}"))?;
 
-    // Derive output BAM filename
+    // Derive output filename
     let out_stem = if let Some(u) = user_outfile {
         base_stem(u)
     } else {
         derive_stem(primary, None)
     };
+    let ext = if sam_mode { "sam" } else { "bam" };
     let out_name = if multiple {
-        format!("{out_stem}.multiple.deduplicated.bam")
+        format!("{out_stem}.multiple.deduplicated.{ext}")
     } else {
-        format!("{out_stem}.deduplicated.bam")
+        format!("{out_stem}.deduplicated.{ext}")
     };
     let out_path = PathBuf::from(format!("{output_dir}{out_name}"));
     eprintln!("Output file is: {out_name}\n");
 
-    // Read header for output BAM
+    // Read header
     let header = get_sam_header(samtools, primary)?;
 
-    let mut out_bam = BamWriter::open_with_threads(samtools, &out_path, parallel)?;
+    let mut out_bam: OutputWriter = if sam_mode {
+        let f = std::fs::File::create(&out_path)
+            .with_context(|| format!("creating {}", out_path.display()))?;
+        OutputWriter::Sam(BufWriter::with_capacity(1 << 20, f))
+    } else {
+        OutputWriter::Bam(BamWriter::open_with_threads(samtools, &out_path, parallel)?)
+    };
     for line in header.lines() {
         if !line.is_empty() {
             out_bam.write_line(line.as_bytes())?;

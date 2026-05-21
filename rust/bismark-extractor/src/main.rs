@@ -107,6 +107,38 @@ struct Cli {
     #[arg(long = "multicore", alias = "parallel", default_value_t = 1)]
     multicore: u32,
 
+    /// Also generate bedGraph and bismark.cov files via bismark2bedGraph
+    #[arg(long = "bedGraph")]
+    bedgraph: bool,
+
+    /// Also generate genome-wide cytosine report via coverage2cytosine (requires --bedGraph and --genome_folder)
+    #[arg(long = "cytosine_report")]
+    cytosine_report: bool,
+
+    /// Genome folder for --cytosine_report
+    #[arg(short = 'g', long = "genome_folder")]
+    genome_folder: Option<PathBuf>,
+
+    /// Split cytosine report by chromosome (forwarded to coverage2cytosine)
+    #[arg(long = "split_by_chromosome")]
+    split_by_chromosome: bool,
+
+    /// Use 0-based coordinates in cytosine report (forwarded to coverage2cytosine)
+    #[arg(long = "zero_based")]
+    zero_based: bool,
+
+    /// Buffer size for sort (forwarded to bismark2bedGraph) [default: 2G]
+    #[arg(long = "buffer_size", default_value = "2G")]
+    buffer_size: String,
+
+    /// Write UCSC-compatible bedGraph (forwarded to bismark2bedGraph)
+    #[arg(long = "ucsc")]
+    ucsc: bool,
+
+    /// Minimum coverage to call methylation in bedGraph (forwarded to bismark2bedGraph) [default: 1]
+    #[arg(long = "coverage_threshold", default_value_t = 1)]
+    coverage_threshold: u32,
+
     /// Print version and exit
     #[arg(long = "version")]
     version: bool,
@@ -776,6 +808,168 @@ fn open_buffer_outputs(mode: OutputMode) -> Result<OutputFiles> {
     })
 }
 
+// ─── bedGraph / cytosine-report dispatch ─────────────────────────────────────
+
+/// Locate a Bismark tool binary: prefer one sitting next to the current exe,
+/// fall back to searching PATH.
+fn find_bismark_tool(name: &str) -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// Return the list of output files that `open_outputs` would have created for
+/// a given stem/mode/gzip combination, so we can pass them to bismark2bedGraph.
+fn collect_output_files(stem: &str, mode: OutputMode, gzip: bool) -> Vec<PathBuf> {
+    let ext = if gzip { ".txt.gz" } else { ".txt" };
+    let contexts = ["CpG", "CHG", "CHH"];
+    let strands = ["OT", "CTOT", "CTOB", "OB"];
+
+    let (dir, base) = match stem.rfind('/') {
+        Some(i) => (&stem[..=i], &stem[i + 1..]),
+        None => ("", stem),
+    };
+
+    let mut files = Vec::new();
+    match mode {
+        OutputMode::StrandSpecific => {
+            for si in 0..4 {
+                for ci in 0..3 {
+                    files.push(PathBuf::from(format!("{dir}{}_{}_{base}{ext}", contexts[ci], strands[si])));
+                }
+            }
+        }
+        OutputMode::Comprehensive => {
+            for ci in 0..3 {
+                files.push(PathBuf::from(format!("{dir}{}_context_{base}{ext}", contexts[ci])));
+            }
+        }
+        OutputMode::MergeNonCpG => {
+            for si in 0..4 {
+                files.push(PathBuf::from(format!("{dir}CpG_{}_{base}{ext}", strands[si])));
+                files.push(PathBuf::from(format!("{dir}Non_CpG_{}_{base}{ext}", strands[si])));
+            }
+        }
+        OutputMode::ComprehensiveMerge => {
+            files.push(PathBuf::from(format!("{dir}CpG_context_{base}{ext}")));
+            files.push(PathBuf::from(format!("{dir}Non_CpG_context_{base}{ext}")));
+        }
+        OutputMode::Yacht => {
+            files.push(PathBuf::from(format!("{dir}any_C_context_{base}{ext}")));
+        }
+    }
+    files
+}
+
+/// Call bismark2bedGraph on the collected extractor output files.
+/// Returns the path to the resulting bismark.cov.gz file.
+fn run_bedgraph(
+    cli: &Cli,
+    output_dir: &str,
+    all_files: &[PathBuf],
+    bare_stem: &str,
+) -> Result<PathBuf> {
+    let tool = find_bismark_tool("bismark2bedGraph");
+    let bedgraph_name = format!("{bare_stem}bedGraph");
+
+    eprintln!("\n\nNow generating a bedGraph file from the methylation extractor output...\n");
+
+    let mut cmd = std::process::Command::new(&tool);
+    cmd.arg("--output").arg(&bedgraph_name);
+    if !output_dir.is_empty() {
+        cmd.arg("--dir").arg(output_dir.trim_end_matches('/'));
+    }
+    if cli.cx_context {
+        cmd.arg("--CX_context");
+    }
+    cmd.arg("--cutoff").arg(cli.coverage_threshold.to_string());
+    if cli.buffer_size != "2G" {
+        cmd.arg("--buffer_size").arg(&cli.buffer_size);
+    }
+    if cli.ucsc {
+        cmd.arg("--ucsc");
+    }
+    if cli.zero_based {
+        cmd.arg("--zero_based");
+    }
+    for f in all_files {
+        cmd.arg(f);
+    }
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run {}", tool.display()))?;
+    if !status.success() {
+        bail!("bismark2bedGraph failed with non-zero exit status");
+    }
+
+    // Derive the coverage file path that bismark2bedGraph will have written.
+    let coverage_name = format!("{bare_stem}bismark.cov.gz");
+    let coverage_path = if output_dir.is_empty() {
+        PathBuf::from(&coverage_name)
+    } else {
+        PathBuf::from(format!("{}/{coverage_name}", output_dir.trim_end_matches('/')))
+    };
+    Ok(coverage_path)
+}
+
+/// Call coverage2cytosine on the bismark.cov.gz produced by bismark2bedGraph.
+fn run_cytosine_report(
+    cli: &Cli,
+    output_dir: &str,
+    coverage_file: &Path,
+    bare_stem: &str,
+) -> Result<()> {
+    let tool = find_bismark_tool("coverage2cytosine");
+
+    let cytosine_out = if cli.cx_context {
+        format!("{bare_stem}CX_report.txt")
+    } else {
+        format!("{bare_stem}CpG_report.txt")
+    };
+
+    let genome_folder = cli
+        .genome_folder
+        .as_ref()
+        .context("--genome_folder is required when --cytosine_report is set")?;
+
+    eprintln!("\n\nNow generating a genome-wide cytosine methylation report...\n");
+
+    let mut cmd = std::process::Command::new(&tool);
+    cmd.arg("--output").arg(&cytosine_out);
+    if !output_dir.is_empty() {
+        cmd.arg("--dir").arg(output_dir.trim_end_matches('/'));
+    }
+    cmd.arg("--genome_folder").arg(genome_folder);
+    if cli.zero_based {
+        cmd.arg("--zero_based");
+    }
+    if cli.cx_context {
+        cmd.arg("--CX_context");
+    }
+    if cli.split_by_chromosome {
+        cmd.arg("--split_by_chromosome");
+    }
+    if cli.gzip {
+        cmd.arg("--gzip");
+    }
+    cmd.arg(coverage_file);
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run {}", tool.display()))?;
+    if !status.success() {
+        bail!("coverage2cytosine failed with non-zero exit status");
+    }
+    Ok(())
+}
+
 // ─── Main processing ─────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -809,6 +1003,13 @@ fn main() -> Result<()> {
         bail!("Core usage needs to be set to 1 or more");
     }
 
+    if cli.cytosine_report && !cli.bedgraph {
+        bail!("--cytosine_report requires --bedGraph");
+    }
+    if cli.cytosine_report && cli.genome_folder.is_none() {
+        bail!("--cytosine_report requires --genome_folder");
+    }
+
     let output_dir = normalise_dir(&cli.output_dir);
 
     let samtools = find_samtools(cli.samtools_path.as_deref())?;
@@ -826,8 +1027,33 @@ fn main() -> Result<()> {
         OutputMode::StrandSpecific
     };
 
+    let mut all_output_files: Vec<PathBuf> = Vec::new();
+    let mut first_bare_stem: Option<String> = None;
+
     for file in &cli.files.clone() {
+        if first_bare_stem.is_none() {
+            first_bare_stem = Some(make_stem(file.to_str().unwrap_or(""), ""));
+        }
         process_file(file, &cli, &samtools, &output_dir, mode)?;
+        if cli.bedgraph {
+            let stem = make_stem(file.to_str().unwrap_or(""), &output_dir);
+            all_output_files.extend(collect_output_files(&stem, mode, cli.gzip));
+        }
+    }
+
+    if cli.bedgraph {
+        if let Some(ref bare_stem) = first_bare_stem {
+            let coverage_path =
+                run_bedgraph(&cli, output_dir.trim_end_matches('/'), &all_output_files, bare_stem)?;
+            if cli.cytosine_report {
+                run_cytosine_report(
+                    &cli,
+                    output_dir.trim_end_matches('/'),
+                    &coverage_path,
+                    bare_stem,
+                )?;
+            }
+        }
     }
 
     Ok(())

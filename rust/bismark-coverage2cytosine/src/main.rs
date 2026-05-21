@@ -74,6 +74,14 @@ struct Cli {
     #[arg(long = "drach", alias = "m6A")]
     drach: bool,
 
+    /// Also output 4-, 5-, and 6-mer sequence context columns
+    #[arg(long = "ffs")]
+    ffs: bool,
+
+    /// [deprecated] Working directory; accepted for compatibility, has no effect
+    #[arg(long = "parent_dir")]
+    parent_dir: Option<String>,
+
     /// Print version and exit
     #[arg(long = "version")]
     version: bool,
@@ -88,6 +96,10 @@ fn main() -> Result<()> {
             BISMARK_VERSION
         );
         return Ok(());
+    }
+
+    if let Some(ref pd) = cli.parent_dir {
+        eprintln!("Note: --parent_dir ('{pd}') is deprecated and has no effect in the Rust version.");
     }
 
     if cli.nome && cli.merge_cpgs {
@@ -411,7 +423,12 @@ fn generate_genome_wide_cytosine_report(
             let tri_str = std::str::from_utf8(&tri).unwrap_or("NNN");
             let ctx_str = context_str(ctx);
 
-            writeln!(active_writer, "{chr}\t{out_pos}\t{strand}\t{meth}\t{unmeth}\t{ctx_str}\t{tri_str}")?;
+            if cli.ffs {
+                let (tetra, penta, hexa) = extract_ffs(seq, i, strand);
+                writeln!(active_writer, "{chr}\t{out_pos}\t{strand}\t{meth}\t{unmeth}\t{ctx_str}\t{tri_str}\t{tetra}\t{penta}\t{hexa}")?;
+            } else {
+                writeln!(active_writer, "{chr}\t{out_pos}\t{strand}\t{meth}\t{unmeth}\t{ctx_str}\t{tri_str}")?;
+            }
 
             if cli.nome {
                 if let Some(ref mut cw) = active_cov {
@@ -684,6 +701,48 @@ fn generate_drach_report(
 fn normalise_dir(s: &str) -> String {
     if s.is_empty() { return String::new(); }
     if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
+}
+
+fn revcomp_slice(seq: &[u8]) -> String {
+    let rc: Vec<u8> = seq.iter().rev().map(|&b| match b {
+        b'A' => b'T', b'T' => b'A', b'G' => b'C', b'C' => b'G', _ => b'N',
+    }).collect();
+    String::from_utf8(rc).unwrap_or_default()
+}
+
+/// Extract 4-, 5-, and 6-mer sequence contexts for --ffs output.
+///
+/// For a forward-strand C at genome index `i`:
+///   tetra = seq[i..i+4], penta = seq[i..i+5], hexa = seq[i-2..i+4]
+/// For a reverse-strand C (G on top strand) at genome index `i`:
+///   tetra = revcomp(seq[i-3..=i]), penta = revcomp(seq[i-4..=i]),
+///   hexa  = revcomp(seq[i-3..i+3])
+/// Returns empty string for any k-mer that would exceed chromosome boundaries.
+fn extract_ffs(seq: &[u8], i: usize, strand: char) -> (String, String, String) {
+    let n = seq.len();
+    if strand == '+' {
+        let tetra = if i + 4 <= n {
+            String::from_utf8_lossy(&seq[i..i + 4]).into_owned()
+        } else {
+            String::new()
+        };
+        let penta = if i + 5 <= n {
+            String::from_utf8_lossy(&seq[i..i + 5]).into_owned()
+        } else {
+            String::new()
+        };
+        let hexa = if i >= 2 && i + 4 <= n {
+            String::from_utf8_lossy(&seq[i - 2..i + 4]).into_owned()
+        } else {
+            String::new()
+        };
+        (tetra, penta, hexa)
+    } else {
+        let tetra = if i >= 3 { revcomp_slice(&seq[i - 3..=i]) } else { String::new() };
+        let penta = if i >= 4 { revcomp_slice(&seq[i - 4..=i]) } else { String::new() };
+        let hexa  = if i >= 3 && i + 3 <= n { revcomp_slice(&seq[i - 3..i + 3]) } else { String::new() };
+        (tetra, penta, hexa)
+    }
 }
 
 #[cfg(test)]

@@ -29,8 +29,8 @@ Bismark needs the following tools to be installed and ideally available in the `
 
 ## Links
 
-- Bismark Publication: http://www.ncbi.nlm.nih.gov/pubmed/21493656
-- Our review about primary data analysis in BS-Seq: http://www.ncbi.nlm.nih.gov/pubmed/22290186
+- Bismark Publication: <http://www.ncbi.nlm.nih.gov/pubmed/21493656>
+- Our review about primary data analysis in BS-Seq: <http://www.ncbi.nlm.nih.gov/pubmed/22290186>
 
 ## Credits
 
