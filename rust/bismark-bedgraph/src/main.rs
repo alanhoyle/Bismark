@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long = "ample_memory")]
     ample_memory: bool,
 
+    /// Include read counts (accepted for compatibility; counts are always included)
+    #[arg(long = "counts")]
+    counts: bool,
+
     /// Also write 0-based half-open coverage file
     #[arg(long = "zero_based")]
     zero_based: bool,

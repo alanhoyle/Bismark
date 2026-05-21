@@ -166,6 +166,7 @@ dependencies = [
  "bismark-lib",
  "clap",
  "flate2",
+ "tempfile",
 ]
 
 [[package]]

@@ -35,6 +35,34 @@ struct Cli {
     #[arg(long = "dir", default_value = "")]
     output_dir: String,
 
+    /// Use 0-based coordinates in output
+    #[arg(long = "zero_based")]
+    zero_based: bool,
+
+    /// Include all cytosine contexts (accepted; NOMe-seq CpG/GC filtering always active)
+    #[arg(long = "CX", alias = "CX_context")]
+    cx_context: bool,
+
+    /// Merge CpG strands (accepted for compatibility)
+    #[arg(long = "merge_CpGs")]
+    merge_cpgs: bool,
+
+    /// Output GC context track (accepted; GC context always included in NOMe-seq mode)
+    #[arg(long = "GC", alias = "GC_context")]
+    gc_context: bool,
+
+    /// Compress output (accepted; output is always gzipped)
+    #[arg(long = "gzip")]
+    gzip: bool,
+
+    /// NOMe-seq mode (accepted; always active)
+    #[arg(long = "nome-seq")]
+    nome_seq: bool,
+
+    /// Working directory (accepted for compatibility)
+    #[arg(long = "parent_dir")]
+    parent_dir: Option<String>,
+
     /// Print version and exit
     #[arg(long = "version")]
     version: bool,

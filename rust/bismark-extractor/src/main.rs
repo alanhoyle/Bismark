@@ -99,6 +99,22 @@ struct Cli {
     #[arg(long = "samtools_path")]
     samtools_path: Option<String>,
 
+    /// Include read counts in bedGraph output (accepted for compatibility; counts are always included)
+    #[arg(long = "counts")]
+    counts: bool,
+
+    /// Replace whitespace in read IDs with underscores (forwarded to bismark2bedGraph)
+    #[arg(long = "remove_spaces")]
+    remove_spaces: bool,
+
+    /// Handle genomes with many scaffolds (forwarded to bismark2bedGraph)
+    #[arg(long = "gazillion", alias = "scaffolds")]
+    gazillion: bool,
+
+    /// Sort in memory rather than using UNIX sort (forwarded to bismark2bedGraph)
+    #[arg(long = "ample_memory")]
+    ample_memory: bool,
+
     /// Print splitting report
     #[arg(long = "report")]
     report: bool,
@@ -876,7 +892,7 @@ fn run_bedgraph(
     bare_stem: &str,
 ) -> Result<PathBuf> {
     let tool = find_bismark_tool("bismark2bedGraph");
-    let bedgraph_name = format!("{bare_stem}bedGraph");
+    let bedgraph_name = format!("{bare_stem}.bedGraph");
 
     eprintln!("\n\nNow generating a bedGraph file from the methylation extractor output...\n");
 
@@ -898,6 +914,15 @@ fn run_bedgraph(
     if cli.zero_based {
         cmd.arg("--zero_based");
     }
+    if cli.remove_spaces {
+        cmd.arg("--remove_spaces");
+    }
+    if cli.gazillion {
+        cmd.arg("--gazillion");
+    }
+    if cli.ample_memory {
+        cmd.arg("--ample_memory");
+    }
     for f in all_files {
         cmd.arg(f);
     }
@@ -910,7 +935,7 @@ fn run_bedgraph(
     }
 
     // Derive the coverage file path that bismark2bedGraph will have written.
-    let coverage_name = format!("{bare_stem}bismark.cov.gz");
+    let coverage_name = format!("{bare_stem}.bismark.cov.gz");
     let coverage_path = if output_dir.is_empty() {
         PathBuf::from(&coverage_name)
     } else {
@@ -929,9 +954,9 @@ fn run_cytosine_report(
     let tool = find_bismark_tool("coverage2cytosine");
 
     let cytosine_out = if cli.cx_context {
-        format!("{bare_stem}CX_report.txt")
+        format!("{bare_stem}.CX_report.txt")
     } else {
-        format!("{bare_stem}CpG_report.txt")
+        format!("{bare_stem}.CpG_report.txt")
     };
 
     let genome_folder = cli

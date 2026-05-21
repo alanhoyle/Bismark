@@ -12,3 +12,6 @@ bismark-lib = { workspace = true }
 clap        = { workspace = true }
 anyhow      = { workspace = true }
 flate2      = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

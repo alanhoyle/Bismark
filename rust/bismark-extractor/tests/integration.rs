@@ -242,3 +242,89 @@ fn test_pe_include_overlap_keeps_all_calls() {
     assert_eq!(cpg.lines().count(), 20, "--include_overlap should keep all R1 and R2 calls:\n{cpg}");
     assert!(cpg.contains("pair1/2\t+\tchr1\t109\tZ"), "overlapping R2 call should be present:\n{cpg}");
 }
+
+// ─── Perl-compat flags accepted without error ─────────────────────────────────
+//
+// These flags exist in the Perl bismark_methylation_extractor and must be accepted
+// so the Rust port is a drop-in replacement.  Each is either a no-op for the
+// extractor itself, or forwarded to bismark2bedGraph when --bedGraph is used.
+
+#[test]
+fn test_counts_flag_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("se.sam");
+    write_sam(&sam, &[ot_se_record()]);
+
+    let output = Command::new(bin())
+        .args(["--single", "--no_header", "--counts"])
+        .arg("--dir").arg(dir.path())
+        .arg(&sam)
+        .output()
+        .expect("binary failed");
+
+    assert!(output.status.success(), "--counts caused failure: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn test_remove_spaces_flag_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("se.sam");
+    write_sam(&sam, &[ot_se_record()]);
+
+    let output = Command::new(bin())
+        .args(["--single", "--no_header", "--remove_spaces"])
+        .arg("--dir").arg(dir.path())
+        .arg(&sam)
+        .output()
+        .expect("binary failed");
+
+    assert!(output.status.success(), "--remove_spaces caused failure: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn test_gazillion_flag_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("se.sam");
+    write_sam(&sam, &[ot_se_record()]);
+
+    let output = Command::new(bin())
+        .args(["--single", "--no_header", "--gazillion"])
+        .arg("--dir").arg(dir.path())
+        .arg(&sam)
+        .output()
+        .expect("binary failed");
+
+    assert!(output.status.success(), "--gazillion caused failure: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn test_ample_memory_flag_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("se.sam");
+    write_sam(&sam, &[ot_se_record()]);
+
+    let output = Command::new(bin())
+        .args(["--single", "--no_header", "--ample_memory"])
+        .arg("--dir").arg(dir.path())
+        .arg(&sam)
+        .output()
+        .expect("binary failed");
+
+    assert!(output.status.success(), "--ample_memory caused failure: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn test_scaffolds_alias_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("se.sam");
+    write_sam(&sam, &[ot_se_record()]);
+
+    let output = Command::new(bin())
+        .args(["--single", "--no_header", "--scaffolds"])
+        .arg("--dir").arg(dir.path())
+        .arg(&sam)
+        .output()
+        .expect("binary failed");
+
+    assert!(output.status.success(), "--scaffolds alias caused failure: {}", String::from_utf8_lossy(&output.stderr));
+}
