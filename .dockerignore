@@ -1,0 +1,11 @@
+rust/target/
+test_files/
+.git/
+.cache/
+.vscode/
+*.bam
+*.bai
+*.fastq.gz
+*.fa.gz
+*.cov
+*.bedGraph
