@@ -36,6 +36,27 @@ Binaries are written to `rust/target/release/`. Samtools must be available in
 
 **Minimum Rust version:** 1.75 (2021 edition)
 
+## Using the Rust tools alongside the Perl aligner
+
+`rust/bismark` is a wrapper script that prepends `rust/target/release/` to
+`PATH` and then invokes the Perl `bismark` aligner. Running it means every
+downstream tool spawned during or after alignment — `bismark_methylation_extractor`,
+`deduplicate_bismark`, `bismark2bedGraph`, etc. — automatically resolves to the
+Rust binary.
+
+Use it in place of the bare `bismark` command:
+
+```bash
+./rust/bismark --genome /path/to/genome -1 r1.fq.gz -2 r2.fq.gz
+```
+
+Or add `rust/` to `PATH` for a session-wide effect:
+
+```bash
+export PATH="/path/to/Bismark/rust:$PATH"
+bismark --genome /path/to/genome -1 r1.fq.gz -2 r2.fq.gz
+```
+
 ## Testing
 
 ### Unit tests
