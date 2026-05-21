@@ -24,36 +24,34 @@
 ###############################################################################
 
 # ── Stage 1: compile Rust downstream tools ────────────────────────────────────
-# TARGETPLATFORM is injected by buildx; the Rust toolchain cross-compiles
-# to the correct architecture automatically.
-FROM --platform=$BUILDPLATFORM rust:slim-bookworm AS builder
+# No --platform override: each target arch builds its own binaries natively
+# under QEMU emulation when cross-building, avoiding cross-linker complexity.
+FROM rust:slim-bookworm AS builder
 
-ARG TARGETPLATFORM
-ARG TARGETARCH
-# Map Docker arch names to Rust target triples
-RUN case "$TARGETARCH" in \
-        amd64) echo x86_64-unknown-linux-gnu   > /target ;; \
-        arm64) echo aarch64-unknown-linux-gnu  > /target ;; \
-        *) echo "Unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
-    esac \
- && rustup target add "$(cat /target)"
+RUN apt-get update \
+ && apt-get upgrade -y \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY rust/ .
-RUN cargo build --release --workspace --target "$(cat /target)"
+# bismark-report and bismark-summary embed plotly assets via include_str! with
+# paths that go three directories above their source files (../../../plotly/).
+# With WORKDIR=/build that resolves to /plotly/, so copy the assets there.
+COPY plotly/ /plotly/
+RUN cargo build --release --workspace
 
 RUN mkdir /out \
- && cp target/"$(cat /target)"/release/bismark_methylation_extractor \
-       target/"$(cat /target)"/release/deduplicate_bismark \
-       target/"$(cat /target)"/release/bismark2bedGraph \
-       target/"$(cat /target)"/release/coverage2cytosine \
-       target/"$(cat /target)"/release/bismark_genome_preparation \
-       target/"$(cat /target)"/release/filter_non_conversion \
-       target/"$(cat /target)"/release/bam2nuc \
-       target/"$(cat /target)"/release/bismark2report \
-       target/"$(cat /target)"/release/bismark2summary \
-       target/"$(cat /target)"/release/methylation_consistency \
-       target/"$(cat /target)"/release/NOMe_filtering \
+ && cp target/release/bismark_methylation_extractor \
+       target/release/deduplicate_bismark \
+       target/release/bismark2bedGraph \
+       target/release/coverage2cytosine \
+       target/release/bismark_genome_preparation \
+       target/release/filter_non_conversion \
+       target/release/bam2nuc \
+       target/release/bismark2report \
+       target/release/bismark2summary \
+       target/release/methylation_consistency \
+       target/release/NOMe_filtering \
        /out/
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
