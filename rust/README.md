@@ -173,7 +173,7 @@ Supply custom data the same way:
 
 ## Project layout
 
-```
+```text
 rust/
 ├── Cargo.toml                    # workspace manifest
 ├── bismark-lib/                  # shared library (BAM I/O, FASTA loading, …)
