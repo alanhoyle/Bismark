@@ -65,10 +65,12 @@ fn main() -> Result<()> {
 
     for bam in &bam_files {
         let sample = read_sample(bam, cli.verbose)?;
+        let dup_col  = sample.dup_reads.map_or(String::new(),    |v| v.to_string());
+        let uniq_col = sample.unique_reads.map_or(String::new(), |v| v.to_string());
         let row = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             bam.display(),
             sample.total_reads, sample.aligned_reads, sample.unaligned,
-            sample.ambig_reads, sample.no_seq_reads, sample.dup_reads, sample.unique_reads,
+            sample.ambig_reads, sample.no_seq_reads, dup_col, uniq_col,
             sample.total_c,
             sample.meth_cpg, sample.unmeth_cpg,
             sample.meth_chg, sample.unmeth_chg,
@@ -109,8 +111,8 @@ struct Sample {
     unaligned:     u64,
     ambig_reads:   u64,
     no_seq_reads:  u64,
-    dup_reads:     u64,
-    unique_reads:  u64,
+    dup_reads:     Option<u64>,
+    unique_reads:  Option<u64>,
     total_c:       u64,
     meth_cpg:      u64,
     unmeth_cpg:    u64,
@@ -184,8 +186,8 @@ fn read_sample(bam: &Path, verbose: bool) -> Result<Sample> {
         PathBuf::from(format!("{base_stripped}.deduplication_report.txt"))
     };
 
-    let mut dup_reads = 0u64;
-    let mut unique_reads = 0u64;
+    let mut dup_reads: Option<u64> = None;
+    let mut unique_reads: Option<u64> = None;
     let has_dedup = dedup_path.exists();
 
     if has_dedup {
@@ -199,12 +201,12 @@ fn read_sample(bam: &Path, verbose: bool) -> Result<Sample> {
             }
             if line.starts_with("Total number duplicated alignments removed:") {
                 if let Some(v) = line.split('\t').nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse().ok()) {
-                    dup_reads = v;
+                    dup_reads = Some(v);
                 }
             }
             if line.starts_with("Total count of deduplicated leftover sequences:") {
                 if let Some(v) = line.split('\t').nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse().ok()) {
-                    unique_reads = v;
+                    unique_reads = Some(v);
                 }
             }
         }
@@ -282,7 +284,7 @@ fn build_html(samples: &[Sample], title: &str, _verbose: bool) -> Result<String>
     let categories: Vec<String> = samples.iter().map(|s| format!("'{}'", s.name)).collect();
     sub(&mut doc, "filenames_replace", &categories.join(","));
 
-    let has_dedup = samples.iter().any(|s| s.dup_reads > 0 || s.unique_reads > 0);
+    let has_dedup = samples.iter().any(|s| s.dup_reads.is_some() || s.unique_reads.is_some());
 
     let joined = |vals: &[u64]| -> String { vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",") };
     let only_empty = |s: &str| s.is_empty() || s.chars().all(|c| c == ',');
@@ -294,13 +296,13 @@ fn build_html(samples: &[Sample], title: &str, _verbose: bool) -> Result<String>
     };
 
     sub(&mut doc, "aligned_seq",       &aligned_str);
-    sub(&mut doc, "dup_alignments",    &joined(&samples.iter().map(|s| s.dup_reads).collect::<Vec<_>>()));
-    sub(&mut doc, "unique_alignments", &joined(&samples.iter().map(|s| s.unique_reads).collect::<Vec<_>>()));
+    sub(&mut doc, "dup_alignments",    &joined(&samples.iter().map(|s| s.dup_reads.unwrap_or(0)).collect::<Vec<_>>()));
+    sub(&mut doc, "unique_alignments", &joined(&samples.iter().map(|s| s.unique_reads.unwrap_or(0)).collect::<Vec<_>>()));
     sub(&mut doc, "not_aligned",       &joined(&samples.iter().map(|s| s.unaligned).collect::<Vec<_>>()));
     sub(&mut doc, "ambig_aligned",     &joined(&samples.iter().map(|s| s.ambig_reads).collect::<Vec<_>>()));
     sub(&mut doc, "no_seq",            &joined(&samples.iter().map(|s| s.no_seq_reads).collect::<Vec<_>>()));
 
-    let dup_str = joined(&samples.iter().map(|s| s.dup_reads).collect::<Vec<_>>());
+    let dup_str = joined(&samples.iter().map(|s| s.dup_reads.unwrap_or(0)).collect::<Vec<_>>());
     if only_empty(&dup_str) {
         doc = remove_section(&doc, "deduplicated_unique_reads_section");
         doc = remove_section(&doc, "duplicated_reads_section");
@@ -328,14 +330,14 @@ fn build_html(samples: &[Sample], title: &str, _verbose: bool) -> Result<String>
 
     for s in samples {
         let total = if has_dedup {
-            (s.unique_reads + s.dup_reads + s.no_seq_reads + s.unaligned + s.ambig_reads) as f64
+            (s.unique_reads.unwrap_or(0) + s.dup_reads.unwrap_or(0) + s.no_seq_reads + s.unaligned + s.ambig_reads) as f64
         } else {
             (s.aligned_reads + s.no_seq_reads + s.unaligned + s.ambig_reads) as f64
         };
         let fmt = |n: u64| -> String {
             if total == 0.0 { "0.00".into() } else { format!("{:.2}", n as f64 / total * 100.0) }
         };
-        if has_dedup { p_dedup.push(fmt(s.unique_reads)); p_dup.push(fmt(s.dup_reads)); }
+        if has_dedup { p_dedup.push(fmt(s.unique_reads.unwrap_or(0))); p_dup.push(fmt(s.dup_reads.unwrap_or(0))); }
         else         { p_al.push(fmt(s.aligned_reads)); }
         p_unal.push(fmt(s.unaligned));
         p_noseq.push(fmt(s.no_seq_reads));
