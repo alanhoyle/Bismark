@@ -1,9 +1,14 @@
 # Bismark — Rust port
 
 This directory contains a Rust reimplementation of the Bismark downstream
-processing tools based on **Bismark v0.25.1**. The Rust binaries are
-drop-in replacements for their Perl counterparts: they accept the same
-command-line flags and produce byte-identical output.
+processing tools, based on **[Bismark v0.25.1](https://github.com/FelixKrueger/Bismark)**
+by Felix Krueger (Altos Bioinformatics). The Rust binaries are drop-in
+replacements for their Perl counterparts: they accept the same command-line
+flags and produce byte-identical output.
+
+This port follows the [rewrites.bio](https://rewrites.bio/) principles:
+credit the original authors, emulate outputs exactly, and be transparent
+about AI assistance and validation.
 
 The main Bismark aligner is not yet ported; alignment still uses the Perl
 `bismark` script backed by Bowtie2, HISAT2, or minimap2.
@@ -24,6 +29,43 @@ The main Bismark aligner is not yet ported; alignment still uses the Perl
 | `methylation_consistency`       | `methylation_consistency`       | Assess read-level methylation consistency                              |
 | `NOMe_filtering`                | `NOMe_filtering`                | Filter NOMe-seq cytosine reports                                       |
 
+## Attribution
+
+Bismark was created by Felix Krueger and Simon Andrews at the Babraham Institute
+and is now maintained at Altos Bioinformatics.
+
+- **Upstream repository:** <https://github.com/FelixKrueger/Bismark>
+- **Citation:** Krueger F & Andrews SR (2011). Bismark: A flexible aligner and
+  methylation caller for Bismark-Seq applications. _Bioinformatics_ 27(11):1571–2.
+  <https://doi.org/10.1093/bioinformatics/btr167>
+
+This Rust port is a derivative work. Please cite the original Bismark paper when
+using these tools in published research.
+
+## AI assistance & validation
+
+This port was written with [Claude Code](https://claude.ai/code) (Anthropic) and
+[OpenAI Codex](https://openai.com/codex), with Codex used in test development.
+
+**Correctness validation:**
+
+- A differential test suite (`tests/differential_test.sh`) runs both the Perl
+  and Rust implementations on identical inputs and diffs every output file
+  byte-for-byte.
+- End-to-end validation was performed against a fork of the
+  [nf-core/methylseq](https://github.com/nf-core/methylseq) pipeline, comparing
+  Perl and Rust outputs at every stage.
+
+**Known gaps:**
+
+- The main `bismark` aligner is not ported; only downstream tools are covered.
+- Validation used paired-end Bowtie2 alignments. HISAT2, minimap2, and single-end
+  modes have lighter test coverage.
+- NOMe-seq and SLAM-seq code paths have not been validated against real data.
+- `bismark2summary` sorts samples lexicographically; the Perl version emits them
+  in filesystem glob order (non-deterministic). Row order in the summary report
+  may differ from Perl when processing multiple samples.
+
 ## Building
 
 ```bash
@@ -35,6 +77,39 @@ Binaries are written to `rust/target/release/`. Samtools must be available in
 `PATH` (or passed via `--samtools_path`) at runtime.
 
 **Minimum Rust version:** current stable (2021 edition)
+
+## Docker
+
+A `Dockerfile` at the repository root builds a two-stage image: the Rust
+downstream tools are compiled in a `rust:slim-bookworm` builder stage; the
+runtime stage is `ubuntu:24.04` with Perl, samtools, Bowtie2, HISAT2, and
+minimap2 pre-installed alongside the Rust binaries.
+
+**Single-platform local build** (run from the repository root):
+
+```bash
+docker build -t bismark .
+```
+
+**Multi-platform build and push** (requires `docker buildx`):
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+    -t bismark --push .
+```
+
+**Run** (mount your working directory as `/data`):
+
+```bash
+docker run --rm -v "$PWD:/data" -w /data bismark \
+    bismark --genome /data/genome -1 r1.fq.gz -2 r2.fq.gz
+
+docker run --rm -v "$PWD:/data" -w /data bismark \
+    bismark_methylation_extractor --paired --comprehensive sample.bam
+```
+
+All Bismark tools — both the Perl aligner and the Rust downstream binaries —
+are on `PATH` inside the container at `/bismark`.
 
 ## Using the Rust tools alongside the Perl aligner
 
@@ -74,13 +149,26 @@ input and diffs every output file byte-for-byte:
 ./tests/differential_test.sh
 ```
 
-Pass `--keep` to retain temporary output directories on failure, or
-`--test-files` to run a full alignment first and then compare downstream tools.
+Pass `--keep` to retain temporary output directories on failure, `--test-files`
+to run a full alignment first and compare downstream tools, or supply your own
+data directly:
+
+```bash
+./tests/differential_test.sh --fasta genome.fa.gz \
+    --fastq1 R1.fastq.gz --fastq2 R2.fastq.gz
+```
 
 ### Performance benchmark
 
 ```bash
 ./tests/performance.sh
+```
+
+Supply custom data the same way:
+
+```bash
+./tests/performance.sh --fasta genome.fa.gz \
+    --fastq1 R1.fastq.gz --fastq2 R2.fastq.gz
 ```
 
 ## Project layout
