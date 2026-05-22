@@ -20,7 +20,11 @@
 #                 Prefers gtime (brew install gnu-time) on macOS for clean
 #                 stderr separation; falls back to /usr/bin/time -l otherwise.
 #   --keep        Keep temporary output directories on failure for inspection
-#   --test-files  Use test_files/ real data instead of synthetic inputs
+#   --test-files  Use test_files/ data instead of synthetic inputs
+#   --fasta FILE  Reference genome FASTA (replaces test_files/NC_010473.fa.gz);
+#                 implies --test-files
+#   --fastq1 FILE R1 FASTQ (replaces test_files/test_R1.fastq.gz)
+#   --fastq2 FILE R2 FASTQ (replaces test_files/test_R2.fastq.gz)
 #
 # Notes:
 #   This is a lightweight benchmark harness, not a statistical benchmark suite.
@@ -40,6 +44,9 @@ THREADS=1
 KEEP=0
 MEASURE_MEM=0
 USE_TEST_FILES=0
+CUSTOM_FASTA=""
+CUSTOM_FASTQ1=""
+CUSTOM_FASTQ2=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -67,8 +74,20 @@ while [[ $# -gt 0 ]]; do
             USE_TEST_FILES=1
             shift
             ;;
+        --fasta)
+            CUSTOM_FASTA="${2:-}"; USE_TEST_FILES=1
+            shift 2
+            ;;
+        --fastq1)
+            CUSTOM_FASTQ1="${2:-}"; USE_TEST_FILES=1
+            shift 2
+            ;;
+        --fastq2)
+            CUSTOM_FASTQ2="${2:-}"; USE_TEST_FILES=1
+            shift 2
+            ;;
         -h|--help)
-            sed -n '1,20p' "$0"
+            sed -n '1,31p' "$0"
             exit 0
             ;;
         *)
@@ -267,9 +286,12 @@ check_prereq() {
     [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
         || die "Rust binaries not built - run: cargo build --release --workspace"
     if [[ "$USE_TEST_FILES" -eq 1 ]]; then
-        [[ -f "$TEST_FILES/NC_010473.fa.gz" ]] || die "NC_010473.fa.gz not found"
-        [[ -f "$TEST_FILES/test_R1.fastq.gz" ]] || die "test_R1.fastq.gz not found"
-        [[ -f "$TEST_FILES/test_R2.fastq.gz" ]] || die "test_R2.fastq.gz not found"
+        local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+        local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
+        local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
+        [[ -f "$fa"  ]] || die "FASTA not found: $fa"
+        [[ -f "$fq1" ]] || die "FASTQ R1 not found: $fq1"
+        [[ -f "$fq2" ]] || die "FASTQ R2 not found: $fq2"
         command -v bowtie2 >/dev/null 2>&1 \
             || die "bowtie2 not in PATH (required for --test-files)"
         command -v bowtie2-build >/dev/null 2>&1 \
@@ -363,24 +385,30 @@ prepare_inputs() {
 
 prepare_test_files_inputs() {
     local wd="$1"
+    local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+    local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
+    local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
     local genome_dir="$wd/test_files"
     mkdir -p "$genome_dir"
-    cp "$TEST_FILES/NC_010473.fa.gz" "$genome_dir/"
-    cp "$TEST_FILES/test_R1.fastq.gz" "$genome_dir/"
-    cp "$TEST_FILES/test_R2.fastq.gz" "$genome_dir/"
+    cp "$fa"  "$genome_dir/"
+    cp "$fq1" "$genome_dir/"
+    cp "$fq2" "$genome_dir/"
+    local fq1_base; fq1_base=$(basename "$fq1")
+    local fq2_base; fq2_base=$(basename "$fq2")
 
-    echo "Preparing copied test_files genome..."
+    echo "Preparing genome..."
     (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" \
         >/dev/null 2>"$wd/logs/genome_preparation.err")
 
-    echo "Aligning test_files paired-end FASTQs with Perl Bismark..."
+    echo "Aligning paired-end FASTQs with Perl Bismark..."
     (cd "$wd" && perl "$PERL_BIN/bismark" \
         --genome "$genome_dir" \
-        -1 "$genome_dir/test_R1.fastq.gz" \
-        -2 "$genome_dir/test_R2.fastq.gz" \
+        -1 "$genome_dir/$fq1_base" \
+        -2 "$genome_dir/$fq2_base" \
         >/dev/null 2>"$wd/logs/bismark_align.err")
 
-    [[ -f "$wd/test_R1_bismark_bt2_pe.bam" ]] || die "Expected Bismark BAM not found"
+    local stem; stem=$(basename "$fq1_base" .gz); stem="${stem%.fastq}"; stem="${stem%.fq}"
+    [[ -f "$wd/${stem}_bismark_bt2_pe.bam" ]] || die "Expected Bismark BAM not found"
 }
 
 # ─── Benchmark functions ───────────────────────────────────────────────────────
@@ -414,8 +442,9 @@ bench_test_files_genome_prep() {
     local perl_genome="$wd/run${run}/genome_prep/perl_genome"
     local rust_genome="$wd/run${run}/genome_prep/rust_genome"
     mkdir -p "$perl_genome" "$rust_genome"
-    cp "$TEST_FILES/NC_010473.fa.gz" "$perl_genome/"
-    cp "$TEST_FILES/NC_010473.fa.gz" "$rust_genome/"
+    local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+    cp "$fa" "$perl_genome/"
+    cp "$fa" "$rust_genome/"
 
     local perl_cmd=(perl "$PERL_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")
     local rust_cmd=("$RUST_BIN/bismark_genome_preparation" --path_to_aligner "$fake_aligner")

@@ -4,18 +4,21 @@
 #
 # Usage:
 #   ./rust/tests/differential_test.sh [--keep] [--test-files]
+#   ./rust/tests/differential_test.sh --fasta FILE --fastq1 FILE --fastq2 FILE
 #
 # Requirements:
 #   - samtools in PATH
 #   - Perl scripts at ../  (relative to rust/)
 #   - Rust binaries built: cargo build --release --workspace
-#   - Test data at ../test_files/
+#   - Test data at ../test_files/  (unless --fasta/--fastq1/--fastq2 are used)
 #
 # Options:
-#   --keep   Keep temporary output directories on failure for inspection
-#   --test-files
-#            Use test_files/test_R1.fastq.gz and test_R2.fastq.gz by running
-#            Perl Bismark first, then compare downstream Perl/Rust tools.
+#   --keep        Keep temporary output directories on failure for inspection
+#   --test-files  Use test_files/ data instead of synthetic inputs
+#   --fasta FILE  Reference genome FASTA (replaces test_files/NC_010473.fa.gz);
+#                 implies --test-files
+#   --fastq1 FILE R1 FASTQ (replaces test_files/test_R1.fastq.gz)
+#   --fastq2 FILE R2 FASTQ (replaces test_files/test_R2.fastq.gz)
 
 set -euo pipefail
 
@@ -27,18 +30,19 @@ TEST_FILES="$REPO_ROOT/test_files"
 
 KEEP=0
 USE_TEST_FILES=0
-for arg in "$@"; do
-    case "$arg" in
-        --keep) KEEP=1 ;;
-        --test-files) USE_TEST_FILES=1 ;;
-        -h|--help)
-            sed -n '1,16p' "$0"
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $arg" >&2
-            exit 2
-            ;;
+CUSTOM_FASTA=""
+CUSTOM_FASTQ1=""
+CUSTOM_FASTQ2=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keep)       KEEP=1; shift ;;
+        --test-files) USE_TEST_FILES=1; shift ;;
+        --fasta)      CUSTOM_FASTA="${2:-}";  USE_TEST_FILES=1; shift 2 ;;
+        --fastq1)     CUSTOM_FASTQ1="${2:-}"; USE_TEST_FILES=1; shift 2 ;;
+        --fastq2)     CUSTOM_FASTQ2="${2:-}"; USE_TEST_FILES=1; shift 2 ;;
+        -h|--help)    sed -n '1,21p' "$0"; exit 0 ;;
+        *)            echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
@@ -49,14 +53,16 @@ PASS=0; FAIL=0
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 check_prereq() {
-    [[ -d "$TEST_FILES" ]] || die "test_files/ not found at $TEST_FILES"
-    [[ -f "$TEST_FILES/NC_010473.fa.gz" ]] || die "NC_010473.fa.gz not found"
-    [[ -f "$TEST_FILES/test_R1.fastq.gz" ]] || die "test_R1.fastq.gz not found"
-    [[ -f "$TEST_FILES/test_R2.fastq.gz" ]] || die "test_R2.fastq.gz not found"
     command -v samtools >/dev/null 2>&1 || die "samtools not in PATH"
     [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
         || die "Rust binaries not built — run: cargo build --release --workspace"
     if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+        local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+        local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
+        local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
+        [[ -f "$fa"  ]] || die "FASTA not found: $fa"
+        [[ -f "$fq1" ]] || die "FASTQ R1 not found: $fq1"
+        [[ -f "$fq2" ]] || die "FASTQ R2 not found: $fq2"
         command -v bowtie2 >/dev/null 2>&1 || die "bowtie2 not in PATH (required for --test-files)"
         command -v bowtie2-build >/dev/null 2>&1 || die "bowtie2-build not in PATH (required for --test-files)"
     fi
@@ -154,23 +160,29 @@ EOF
 
 prepare_test_files_alignment() {
     local wd="$1"
+    local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+    local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
+    local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
     local genome_dir="$wd/test_files"
     mkdir -p "$genome_dir"
-    cp "$TEST_FILES/NC_010473.fa.gz" "$genome_dir/"
-    cp "$TEST_FILES/test_R1.fastq.gz" "$genome_dir/"
-    cp "$TEST_FILES/test_R2.fastq.gz" "$genome_dir/"
+    cp "$fa"  "$genome_dir/"
+    cp "$fq1" "$genome_dir/"
+    cp "$fq2" "$genome_dir/"
+    local fq1_base; fq1_base=$(basename "$fq1")
+    local fq2_base; fq2_base=$(basename "$fq2")
 
-    echo "  Preparing copied test_files genome..." >&2
+    echo "  Preparing genome..." >&2
     (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" >/dev/null 2>"$wd/genome_preparation.err")
 
-    echo "  Aligning test_files paired-end FASTQs with Perl Bismark..." >&2
+    echo "  Aligning paired-end FASTQs with Perl Bismark..." >&2
     (cd "$wd" && perl "$PERL_BIN/bismark" \
         --genome "$genome_dir" \
-        -1 "$genome_dir/test_R1.fastq.gz" \
-        -2 "$genome_dir/test_R2.fastq.gz" \
+        -1 "$genome_dir/$fq1_base" \
+        -2 "$genome_dir/$fq2_base" \
         >/dev/null 2>"$wd/bismark_align.err")
 
-    local bam="$wd/test_R1_bismark_bt2_pe.bam"
+    local stem; stem=$(basename "$fq1_base" .gz); stem="${stem%.fastq}"; stem="${stem%.fq}"
+    local bam="$wd/${stem}_bismark_bt2_pe.bam"
     [[ -f "$bam" ]] || die "Expected Bismark BAM not found at $bam"
     echo "$bam"
 }
