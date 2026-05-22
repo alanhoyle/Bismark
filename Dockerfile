@@ -52,6 +52,7 @@ RUN mkdir /out \
        target/release/bismark2summary \
        target/release/methylation_consistency \
        target/release/NOMe_filtering \
+       target/release/bistromark \
        /out/
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────

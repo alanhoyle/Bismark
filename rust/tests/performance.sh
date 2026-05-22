@@ -25,6 +25,8 @@
 #                 implies --test-files
 #   --fastq1 FILE R1 FASTQ (replaces test_files/test_R1.fastq.gz)
 #   --fastq2 FILE R2 FASTQ (replaces test_files/test_R2.fastq.gz)
+#   --genome DIR  Pre-prepared Bismark genome directory (skips genome
+#                 preparation step); implies --test-files
 #
 # Notes:
 #   This is a lightweight benchmark harness, not a statistical benchmark suite.
@@ -37,6 +39,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUST_BIN="$SCRIPT_DIR/../target/release"
 PERL_BIN="$REPO_ROOT"
 TEST_FILES="$REPO_ROOT/test_files"
+TMPDIR_BASE="$SCRIPT_DIR/tmp"
 
 RUNS=3
 RECORDS=50000
@@ -47,6 +50,7 @@ USE_TEST_FILES=0
 CUSTOM_FASTA=""
 CUSTOM_FASTQ1=""
 CUSTOM_FASTQ2=""
+CUSTOM_GENOME=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,6 +88,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --fastq2)
             CUSTOM_FASTQ2="${2:-}"; USE_TEST_FILES=1
+            shift 2
+            ;;
+        --genome)
+            CUSTOM_GENOME="${2:-}"; USE_TEST_FILES=1
             shift 2
             ;;
         -h|--help)
@@ -174,24 +182,25 @@ LAST_ELAPSED="0"
 
 time_command() {
     LAST_LOG_PREFIX="$1"; shift
-    local start end
+    local start end _rc=0
     start="$(now_seconds)"
     if [[ "$MEASURE_MEM" -eq 1 ]]; then
         local timemem="${LAST_LOG_PREFIX}.timemem"
         if [[ "$TIME_SUPPORTS_OUTFILE" -eq 1 ]]; then
             # Write time stats to a separate file; command stderr goes to .err
             "$TIME_CMD" $TIME_ARGS -o "$timemem" \
-                "$@" >"${LAST_LOG_PREFIX}.out" 2>"${LAST_LOG_PREFIX}.err"
+                "$@" >"${LAST_LOG_PREFIX}.out" 2>"${LAST_LOG_PREFIX}.err" || _rc=$?
         else
             # macOS fallback: command stderr and time stats both go to .timemem
             "$TIME_CMD" $TIME_ARGS \
-                "$@" >"${LAST_LOG_PREFIX}.out" 2>"$timemem"
+                "$@" >"${LAST_LOG_PREFIX}.out" 2>"$timemem" || _rc=$?
         fi
     else
-        "$@" >"${LAST_LOG_PREFIX}.out" 2>"${LAST_LOG_PREFIX}.err"
+        "$@" >"${LAST_LOG_PREFIX}.out" 2>"${LAST_LOG_PREFIX}.err" || _rc=$?
     fi
     end="$(now_seconds)"
     LAST_ELAPSED="$(elapsed_seconds "$start" "$end")"
+    return $_rc
 }
 
 # ─── Statistics helpers ───────────────────────────────────────────────────────
@@ -264,7 +273,8 @@ normalise_dir() {
 }
 
 make_workdir() {
-    mktemp -d
+    mkdir -p "$TMPDIR_BASE"
+    mktemp -d "$TMPDIR_BASE/perf-XXXXXXXX"
 }
 
 cleanup() {
@@ -273,6 +283,15 @@ cleanup() {
         rm -rf "$dir"
     else
         echo "Kept working directory: $dir"
+    fi
+}
+
+log_step() {
+    local case="$1" impl="$2"
+    if [[ "$impl" == "perl" ]]; then
+        printf "  %-44s [perl]" "$case"
+    else
+        printf " [rust]"
     fi
 }
 
@@ -286,16 +305,25 @@ check_prereq() {
     [[ -f "$RUST_BIN/bismark_methylation_extractor" ]] \
         || die "Rust binaries not built - run: cargo build --release --workspace"
     if [[ "$USE_TEST_FILES" -eq 1 ]]; then
-        local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
         local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
         local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
-        [[ -f "$fa"  ]] || die "FASTA not found: $fa"
         [[ -f "$fq1" ]] || die "FASTQ R1 not found: $fq1"
         [[ -f "$fq2" ]] || die "FASTQ R2 not found: $fq2"
+        if [[ -n "$CUSTOM_GENOME" ]]; then
+            [[ -d "$CUSTOM_GENOME" ]] \
+                || die "Genome directory not found: $CUSTOM_GENOME"
+            [[ -d "$CUSTOM_GENOME/Bisulfite_Genome" ]] \
+                || die "Not a prepared Bismark genome (missing Bisulfite_Genome/): $CUSTOM_GENOME"
+        else
+            local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+            [[ -f "$fa" ]] || die "FASTA not found: $fa"
+            command -v bowtie2-build >/dev/null 2>&1 \
+                || die "bowtie2-build not in PATH (required for genome preparation)"
+        fi
         command -v bowtie2 >/dev/null 2>&1 \
             || die "bowtie2 not in PATH (required for --test-files)"
-        command -v bowtie2-build >/dev/null 2>&1 \
-            || die "bowtie2-build not in PATH (required for --test-files)"
+        [[ -f "$RUST_BIN/bistromark" ]] \
+            || die "bistromark not built — run: cargo build --release --workspace"
     fi
 }
 
@@ -385,30 +413,34 @@ prepare_inputs() {
 
 prepare_test_files_inputs() {
     local wd="$1"
-    local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
     local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
     local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
-    local genome_dir="$wd/test_files"
-    mkdir -p "$genome_dir"
-    cp "$fa"  "$genome_dir/"
-    cp "$fq1" "$genome_dir/"
-    cp "$fq2" "$genome_dir/"
     local fq1_base; fq1_base=$(basename "$fq1")
-    local fq2_base; fq2_base=$(basename "$fq2")
+    local genome_dir
 
-    echo "Preparing genome..."
-    (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" \
-        >/dev/null 2>"$wd/logs/genome_preparation.err")
+    if [[ -n "$CUSTOM_GENOME" ]]; then
+        genome_dir="$CUSTOM_GENOME"
+        # Symlink so bench functions can reference $wd/test_files without changes.
+        ln -s "$genome_dir" "$wd/test_files"
+        echo "Using pre-prepared genome: $genome_dir"
+    else
+        local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+        genome_dir="$wd/test_files"
+        mkdir -p "$genome_dir"
+        cp "$fa" "$genome_dir/"
+        echo "Preparing genome..."
+        (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" \
+            >/dev/null 2>"$wd/logs/genome_preparation.err")
+    fi
 
     echo "Aligning paired-end FASTQs with Perl Bismark..."
     (cd "$wd" && perl "$PERL_BIN/bismark" \
         --genome "$genome_dir" \
-        -1 "$genome_dir/$fq1_base" \
-        -2 "$genome_dir/$fq2_base" \
+        -1 "$fq1" -2 "$fq2" \
         >/dev/null 2>"$wd/logs/bismark_align.err")
 
     local stem; stem=$(basename "$fq1_base" .gz); stem="${stem%.fastq}"; stem="${stem%.fq}"
-    [[ -f "$wd/${stem}_bismark_bt2_pe.bam" ]] || die "Expected Bismark BAM not found"
+    [[ -f "$wd/${stem}_bismark_bt2_pe.bam" ]] || die "Expected Bismark BAM not found: $wd/${stem}_bismark_bt2_pe.bam"
 }
 
 # ─── Benchmark functions ───────────────────────────────────────────────────────
@@ -429,11 +461,14 @@ bench_genome_prep() {
         rust_cmd+=(--parallel "$THREADS")
     fi
 
+    log_step "bismark_genome_preparation" "perl"
     time_command "$wd/logs/genome_prep_perl_$run" "${perl_cmd[@]}" "$perl_genome"
     append_result "bismark_genome_preparation" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "bismark_genome_preparation" "rust"
     time_command "$wd/logs/genome_prep_rust_$run" "${rust_cmd[@]}" "$rust_genome"
     append_result "bismark_genome_preparation" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_test_files_genome_prep() {
@@ -453,11 +488,14 @@ bench_test_files_genome_prep() {
         rust_cmd+=(--parallel "$THREADS")
     fi
 
+    log_step "test_files/bismark_genome_preparation" "perl"
     time_command "$wd/logs/test_files_genome_prep_perl_$run" "${perl_cmd[@]}" "$perl_genome"
     append_result "test_files/bismark_genome_preparation" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "test_files/bismark_genome_preparation" "rust"
     time_command "$wd/logs/test_files_genome_prep_rust_$run" "${rust_cmd[@]}" "$rust_genome"
     append_result "test_files/bismark_genome_preparation" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_extractor() {
@@ -466,17 +504,20 @@ bench_extractor() {
     local rust_dir="$wd/run${run}/extractor/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
+    log_step "bismark_methylation_extractor" "perl"
     time_command "$wd/logs/extractor_perl_$run" \
         perl "$PERL_BIN/bismark_methylation_extractor" \
-        --single --no_header --mbias_off --comprehensive --parallel "$THREADS" \
+        --single --no_header --mbias_off --ample_memory --comprehensive --parallel "$THREADS" \
         --output "$perl_dir" "$wd/large.sam"
     append_result "bismark_methylation_extractor" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "bismark_methylation_extractor" "rust"
     time_command "$wd/logs/extractor_rust_$run" \
         "$RUST_BIN/bismark_methylation_extractor" \
         --single --no_header --mbias_off --comprehensive --parallel "$THREADS" \
         --dir "$rust_dir" "$wd/large.sam"
     append_result "bismark_methylation_extractor" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_test_files_extractor() {
@@ -485,17 +526,20 @@ bench_test_files_extractor() {
     local rust_dir="$wd/run${run}/extractor/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
+    log_step "test_files/bismark_methylation_extractor" "perl"
     time_command "$wd/logs/test_files_extractor_perl_$run" \
         perl "$PERL_BIN/bismark_methylation_extractor" \
         --paired --no_header --mbias_off --comprehensive --parallel "$THREADS" \
         --output "$perl_dir" "$wd/test_R1_bismark_bt2_pe.bam"
     append_result "test_files/bismark_methylation_extractor" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "test_files/bismark_methylation_extractor" "rust"
     time_command "$wd/logs/test_files_extractor_rust_$run" \
         "$RUST_BIN/bismark_methylation_extractor" \
         --paired --no_header --mbias_off --comprehensive --parallel "$THREADS" \
         --dir "$rust_dir" "$wd/test_R1_bismark_bt2_pe.bam"
     append_result "test_files/bismark_methylation_extractor" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_dedup() {
@@ -508,15 +552,18 @@ bench_dedup() {
     cp "$wd/large.bam"     "$rust_dir/large.bam"
     cp "$wd/large.bam.bai" "$rust_dir/large.bam.bai"
 
+    log_step "deduplicate_bismark" "perl"
     time_command "$wd/logs/dedup_perl_$run" \
         perl "$PERL_BIN/deduplicate_bismark" \
         --single --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/large.bam"
     append_result "deduplicate_bismark" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "deduplicate_bismark" "rust"
     time_command "$wd/logs/dedup_rust_$run" \
         "$RUST_BIN/deduplicate_bismark" \
         --single --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/large.bam"
     append_result "deduplicate_bismark" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_test_files_dedup() {
@@ -527,15 +574,18 @@ bench_test_files_dedup() {
     cp "$wd/test_R1_bismark_bt2_pe.bam" "$perl_dir/test.bam"
     cp "$wd/test_R1_bismark_bt2_pe.bam" "$rust_dir/test.bam"
 
+    log_step "test_files/deduplicate_bismark" "perl"
     time_command "$wd/logs/test_files_dedup_perl_$run" \
         perl "$PERL_BIN/deduplicate_bismark" \
         --paired --parallel "$THREADS" --output_dir "$perl_dir" "$perl_dir/test.bam"
     append_result "test_files/deduplicate_bismark" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "test_files/deduplicate_bismark" "rust"
     time_command "$wd/logs/test_files_dedup_rust_$run" \
         "$RUST_BIN/deduplicate_bismark" \
         --paired --parallel "$THREADS" --output_dir "$rust_dir" "$rust_dir/test.bam"
     append_result "test_files/deduplicate_bismark" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_bedgraph() {
@@ -544,15 +594,18 @@ bench_bedgraph() {
     local rust_dir="$wd/run${run}/bedgraph/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
+    log_step "bismark2bedGraph" "perl"
     time_command "$wd/logs/bedgraph_perl_$run" \
         perl "$PERL_BIN/bismark2bedGraph" \
         --output large.bedGraph --no_header --dir "$perl_dir" "$wd/CpG_OT_large.txt"
     append_result "bismark2bedGraph" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "bismark2bedGraph" "rust"
     time_command "$wd/logs/bedgraph_rust_$run" \
         "$RUST_BIN/bismark2bedGraph" \
         --output large.bedGraph --no_header --dir "$rust_dir" "$wd/CpG_OT_large.txt"
     append_result "bismark2bedGraph" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_test_files_bedgraph() {
@@ -566,15 +619,18 @@ bench_test_files_bedgraph() {
     local rust_dir="$wd/run${run}/bedgraph/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
+    log_step "test_files/bismark2bedGraph" "perl"
     time_command "$wd/logs/test_files_bedgraph_perl_$run" \
         perl "$PERL_BIN/bismark2bedGraph" \
         --output test_files.bedGraph --no_header --dir "$perl_dir" "$cpg_file"
     append_result "test_files/bismark2bedGraph" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "test_files/bismark2bedGraph" "rust"
     time_command "$wd/logs/test_files_bedgraph_rust_$run" \
         "$RUST_BIN/bismark2bedGraph" \
         --output test_files.bedGraph --no_header --dir "$rust_dir" "$cpg_file"
     append_result "test_files/bismark2bedGraph" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_coverage2cytosine() {
@@ -583,17 +639,20 @@ bench_coverage2cytosine() {
     local rust_dir="$wd/run${run}/coverage2cytosine/rust"
     mkdir -p "$perl_dir" "$rust_dir"
 
+    log_step "coverage2cytosine" "perl"
     time_command "$wd/logs/coverage2cytosine_perl_$run" \
         perl "$PERL_BIN/coverage2cytosine" \
         --genome_folder "$wd/genome" \
         --output "$perl_dir/large.CpG_report.txt" "$wd/large.cov"
     append_result "coverage2cytosine" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "coverage2cytosine" "rust"
     time_command "$wd/logs/coverage2cytosine_rust_$run" \
         "$RUST_BIN/coverage2cytosine" \
         --genome_folder "$wd/genome" \
         --output "$rust_dir/large.CpG_report.txt" "$wd/large.cov"
     append_result "coverage2cytosine" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
 }
 
 bench_test_files_coverage2cytosine() {
@@ -605,17 +664,53 @@ bench_test_files_coverage2cytosine() {
     local cov="$wd/run${run}/bedgraph/rust/test_files.bismark.cov.gz"
     [[ -f "$cov" ]] || die "No test_files coverage file found for coverage2cytosine benchmark"
 
+    log_step "test_files/coverage2cytosine" "perl"
     time_command "$wd/logs/test_files_coverage2cytosine_perl_$run" \
         perl "$PERL_BIN/coverage2cytosine" \
         --genome_folder "$wd/test_files" \
         --output "$perl_dir/test_files.CpG_report.txt" "$cov"
     append_result "test_files/coverage2cytosine" "perl" "$run" "$LAST_ELAPSED"
 
+    log_step "test_files/coverage2cytosine" "rust"
     time_command "$wd/logs/test_files_coverage2cytosine_rust_$run" \
         "$RUST_BIN/coverage2cytosine" \
         --genome_folder "$wd/test_files" \
         --output "$rust_dir/test_files.CpG_report.txt" "$cov"
     append_result "test_files/coverage2cytosine" "rust" "$run" "$LAST_ELAPSED"
+    printf "\n"
+}
+
+bench_test_files_bistromark() {
+    local wd="$1" run="$2"
+    local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
+    local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
+    local perl_dir="$wd/run${run}/aligner/perl"
+    local bistro_dir="$wd/run${run}/aligner/bistro"
+    mkdir -p "$perl_dir" "$bistro_dir"
+
+    log_step "test_files/bismark_aligner" "perl"
+    if time_command "$wd/logs/test_files_perl_align_$run" \
+        perl "$PERL_BIN/bismark" \
+        --genome "$wd/test_files" \
+        -o "$perl_dir" \
+        -1 "$fq1" -2 "$fq2"; then
+        append_result "test_files/bismark_aligner" "perl" "$run" "$LAST_ELAPSED"
+    else
+        echo "WARNING: Perl bismark aligner failed on run $run (see $wd/logs/test_files_perl_align_$run.err)" >&2
+    fi
+
+    log_step "test_files/bismark_aligner" "rust"
+    if time_command "$wd/logs/test_files_bistromark_$run" \
+        "$RUST_BIN/bistromark" \
+        --genome "$wd/test_files" \
+        --output_dir "$bistro_dir" \
+        -1 "$fq1" -2 "$fq2"; then
+        printf "\n"
+        append_result "test_files/bismark_aligner" "rust" "$run" "$LAST_ELAPSED"
+    else
+        printf "\n"
+        echo "WARNING: bistromark failed on run $run (see $wd/logs/test_files_bistromark_$run.err)" >&2
+    fi
 }
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
@@ -688,10 +783,9 @@ print_summary() {
     done <<< "$cases"
 
     echo ""
+    echo "Raw results: $RESULTS"
     if [[ "$KEEP" -eq 1 ]]; then
-        echo "Raw results: $RESULTS"
-    else
-        echo "Raw results are kept only with --keep."
+        echo "Working directory: $WD"
     fi
     if [[ "$MEASURE_MEM" -eq 1 ]]; then
         echo "RAM figures are mean peak RSS across $RUNS run(s)."
@@ -707,7 +801,7 @@ check_prereq
 setup_time_cmd
 
 WD="$(make_workdir)"
-RESULTS="$WD/results.csv"
+RESULTS="$TMPDIR_BASE/perf-$(date +%Y%m%d-%H%M%S).csv"
 mkdir -p "$WD/logs"
 printf "case,implementation,seconds,run,rss_bytes\n" > "$RESULTS"
 FAKE_ALIGNER="$(make_fake_aligner_dir "$WD")"
@@ -728,11 +822,14 @@ for run in $(seq 1 "$RUNS"); do
     echo ""
     echo "Run $run/$RUNS"
     if [[ "$USE_TEST_FILES" -eq 1 ]]; then
-        bench_test_files_genome_prep "$WD" "$run" "$FAKE_ALIGNER"
+        if [[ -z "$CUSTOM_GENOME" ]]; then
+            bench_test_files_genome_prep "$WD" "$run" "$FAKE_ALIGNER"
+        fi
         bench_test_files_extractor   "$WD" "$run"
         bench_test_files_dedup       "$WD" "$run"
         bench_test_files_bedgraph    "$WD" "$run"
         bench_test_files_coverage2cytosine "$WD" "$run"
+        bench_test_files_bistromark  "$WD" "$run"
     else
         bench_genome_prep      "$WD" "$run" "$FAKE_ALIGNER"
         bench_extractor        "$WD" "$run"

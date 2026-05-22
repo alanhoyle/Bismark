@@ -27,12 +27,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUST_BIN="$SCRIPT_DIR/../target/release"
 PERL_BIN="$REPO_ROOT"
 TEST_FILES="$REPO_ROOT/test_files"
+TMPDIR_BASE="$SCRIPT_DIR/tmp"
 
 KEEP=0
 USE_TEST_FILES=0
 CUSTOM_FASTA=""
 CUSTOM_FASTQ1=""
 CUSTOM_FASTQ2=""
+SHARED_GENOME_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -65,6 +67,8 @@ check_prereq() {
         [[ -f "$fq2" ]] || die "FASTQ R2 not found: $fq2"
         command -v bowtie2 >/dev/null 2>&1 || die "bowtie2 not in PATH (required for --test-files)"
         command -v bowtie2-build >/dev/null 2>&1 || die "bowtie2-build not in PATH (required for --test-files)"
+        [[ -f "$RUST_BIN/bistromark" ]] \
+            || die "bistromark not built — run: cargo build --release --workspace"
     fi
 }
 
@@ -141,9 +145,83 @@ run_diff_sorted() {
     rm -f "$p_sorted" "$r_sorted"
 }
 
+run_diff_bam_key_fields() {
+    # Compare QNAME FLAG RNAME POS CIGAR + XM XR XG NM tags, sorted by QNAME.
+    # Alignment position and methylation calls should be identical; read order may differ.
+    # MAPQ is intentionally ignored; Bismark/Bowtie2 wrapper details can shift
+    # MAPQ by a point without changing the selected alignment or methylation calls.
+    local name="$1" perl_bam="$2" rust_bam="$3"
+    local p_tmp r_tmp
+    p_tmp=$(mktemp)
+    r_tmp=$(mktemp)
+    local extract_awk='{ xm=""; xr=""; xg=""; nm=""
+        for (i=12; i<=NF; i++) {
+            if      ($i ~ /^XM:Z:/) xm=$i
+            else if ($i ~ /^XR:Z:/) xr=$i
+            else if ($i ~ /^XG:Z:/) xg=$i
+            else if ($i ~ /^NM:i:/) nm=$i
+        }
+        print $1, $2, $3, $4, $6, xm, xr, xg, nm
+    }'
+    samtools view "$perl_bam" | awk "$extract_awk" | sort > "$p_tmp"
+    samtools view "$rust_bam" | awk "$extract_awk" | sort > "$r_tmp"
+    if diff -q "$p_tmp" "$r_tmp" >/dev/null 2>&1; then
+        echo "  PASS  $name (BAM key fields)"
+        PASS=$(( PASS + 1 ))
+    else
+        echo "  FAIL  $name (BAM key fields)"
+        diff --unified=3 "$p_tmp" "$r_tmp" | head -30 || true
+        FAIL=$(( FAIL + 1 ))
+    fi
+    rm -f "$p_tmp" "$r_tmp"
+}
+
+run_diff_bismark_report() {
+    local name="$1" perl_rep="$2" rust_rep="$3"
+    # Compare report metrics rather than prose. The Rust report does not need to
+    # reproduce Perl's path-heavy headings or explanatory strand labels byte-for-byte.
+    local report_awk='
+        function val() { split($0,a,"\t"); gsub(/^[ ]+|[ ]+$/, "", a[2]); return a[2] }
+        /^Sequences analysed in total:/ { print "total", val() }
+        /^Sequence pairs analysed in total:/ { print "total", val() }
+        /^Number of alignments with a unique best hit/ { print "unique", val() }
+        /^Number of paired-end alignments with a unique best hit:/ { print "unique", val() }
+        /^Mapping efficiency:/ { print "mapping", val() }
+        /^Sequences with no alignments under any condition:/ { print "unmapped", val() }
+        /^Sequence pairs with no alignments under any condition:/ { print "unmapped", val() }
+        /^Sequences did not map uniquely:/ { print "ambiguous", val() }
+        /^Sequence pairs did not map uniquely:/ { print "ambiguous", val() }
+        /^Sequences which were discarded because genomic sequence could not be extracted:/ { print "no_genomic_seq", val() }
+        /^Sequence pairs which were discarded because genomic sequence could not be extracted:/ { print "no_genomic_seq", val() }
+        /^Total number of C'\''s analysed:/ { print "total_c", val() }
+        /^Total methylated C'\''s in / { print $1,$2,$3,$4,$5,$6, val() }
+        /^Total unmethylated C'\''s in / { print $1,$2,$3,$4,$5,$6, val() }
+        /^C methylated in Unknown context/ { next }
+        /^C methylated in / { print $1,$2,$3,$4,$5, val() }
+    '
+    if diff -q <(awk "$report_awk" "$perl_rep") <(awk "$report_awk" "$rust_rep") >/dev/null 2>&1; then
+        echo "  PASS  $name"
+        PASS=$(( PASS + 1 ))
+    else
+        echo "  FAIL  $name"
+        diff --unified=3 <(awk "$report_awk" "$perl_rep") <(awk "$report_awk" "$rust_rep") | head -30 || true
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
+require_file() {
+    local label="$1" path="$2"
+    if [[ -f "$path" ]]; then
+        return 0
+    fi
+    echo "  FAIL  $label (missing file: $path)"
+    FAIL=$(( FAIL + 1 ))
+    return 1
+}
+
 make_workdir() {
-    local d; d=$(mktemp -d)
-    echo "$d"
+    mkdir -p "$TMPDIR_BASE"
+    mktemp -d "$TMPDIR_BASE/diff-XXXXXXXX"
 }
 
 make_fake_aligner_dir() {
@@ -158,27 +236,28 @@ EOF
     echo "$bin_dir"
 }
 
+prepare_shared_genome() {
+    [[ -n "$SHARED_GENOME_DIR" ]] && return
+    local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
+    mkdir -p "$TMPDIR_BASE"
+    SHARED_GENOME_DIR="$(mktemp -d "$TMPDIR_BASE/genome-XXXXXXXX")"
+    cp "$fa" "$SHARED_GENOME_DIR/"
+    echo "Preparing shared genome (one-time)..." >&2
+    perl "$PERL_BIN/bismark_genome_preparation" "$SHARED_GENOME_DIR" \
+        >/dev/null 2>"$SHARED_GENOME_DIR/genome_prep.err"
+}
+
 prepare_test_files_alignment() {
     local wd="$1"
-    local fa="${CUSTOM_FASTA:-$TEST_FILES/NC_010473.fa.gz}"
     local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
     local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
-    local genome_dir="$wd/test_files"
-    mkdir -p "$genome_dir"
-    cp "$fa"  "$genome_dir/"
-    cp "$fq1" "$genome_dir/"
-    cp "$fq2" "$genome_dir/"
     local fq1_base; fq1_base=$(basename "$fq1")
-    local fq2_base; fq2_base=$(basename "$fq2")
-
-    echo "  Preparing genome..." >&2
-    (cd "$wd" && perl "$PERL_BIN/bismark_genome_preparation" "$genome_dir" >/dev/null 2>"$wd/genome_preparation.err")
 
     echo "  Aligning paired-end FASTQs with Perl Bismark..." >&2
     (cd "$wd" && perl "$PERL_BIN/bismark" \
-        --genome "$genome_dir" \
-        -1 "$genome_dir/$fq1_base" \
-        -2 "$genome_dir/$fq2_base" \
+        --genome "$SHARED_GENOME_DIR" \
+        -1 "$fq1" \
+        -2 "$fq2" \
         >/dev/null 2>"$wd/bismark_align.err")
 
     local stem; stem=$(basename "$fq1_base" .gz); stem="${stem%.fastq}"; stem="${stem%.fq}"
@@ -711,14 +790,129 @@ test_test_files_inputs() {
     perl_dir="$wd/cytosine_perl"; rust_dir="$wd/cytosine_rust"
     mkdir -p "$perl_dir" "$rust_dir"
     perl "$PERL_BIN/coverage2cytosine" \
-        --genome_folder "$wd/test_files" \
+        --genome_folder "$SHARED_GENOME_DIR" \
         --output "$perl_dir/test_files.CpG_report.txt" \
         "$perl_dir/../bedgraph_perl/test_files.bismark.cov.gz" 2>/dev/null
     "$RUST_BIN/coverage2cytosine" \
-        --genome_folder "$wd/test_files" \
+        --genome_folder "$SHARED_GENOME_DIR" \
         --output "$rust_dir/test_files.CpG_report.txt" \
         "$rust_dir/../bedgraph_rust/test_files.bismark.cov.gz" 2>/dev/null
     run_diff "test_files/CpG_report" "$perl_dir/test_files.CpG_report.txt" "$rust_dir/test_files.CpG_report.txt"
+
+    cleanup "$wd"
+}
+
+# ─── Test: bistromark PE alignment ───────────────────────────────────────────
+
+test_bistromark_pe() {
+    echo ""
+    echo "=== bistromark PE vs Perl bismark ==="
+
+    local wd; wd=$(make_workdir)
+    local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
+    local fq2="${CUSTOM_FASTQ2:-$TEST_FILES/test_R2.fastq.gz}"
+    local fq1_base; fq1_base=$(basename "$fq1")
+    local stem; stem=$(basename "$fq1_base" .gz)
+    stem="${stem%.fastq}"; stem="${stem%.fq}"
+    local genome_dir="$SHARED_GENOME_DIR"
+
+    local perl_dir="$wd/perl" bistro_dir="$wd/bistro"
+    mkdir -p "$perl_dir" "$bistro_dir"
+
+    echo "  Aligning with Perl bismark (PE)..." >&2
+    if ! (cd "$perl_dir" && perl "$PERL_BIN/bismark" \
+        --genome "$genome_dir" \
+        -1 "$fq1" -2 "$fq2" \
+        >/dev/null 2>"$wd/perl_align.err"); then
+        echo "  FAIL  bistromark_pe/perl_align"
+        sed -n '1,40p' "$wd/perl_align.err" || true
+        FAIL=$(( FAIL + 1 ))
+        cleanup "$wd"
+        return
+    fi
+
+    echo "  Aligning with bistromark (PE)..." >&2
+    if ! "$RUST_BIN/bistromark" \
+        --genome "$genome_dir" \
+        -1 "$fq1" -2 "$fq2" \
+        --output_dir "$bistro_dir" \
+        >/dev/null 2>"$wd/bistro_align.err"; then
+        echo "  FAIL  bistromark_pe/bistro_align"
+        sed -n '1,40p' "$wd/bistro_align.err" || true
+        FAIL=$(( FAIL + 1 ))
+        cleanup "$wd"
+        return
+    fi
+
+    local perl_bam="$perl_dir/${stem}_bismark_bt2_pe.bam"
+    local bistro_bam="$bistro_dir/${stem}_bismark_bt2_pe.bam"
+    local perl_rep="$perl_dir/${stem}_bismark_bt2_PE_report.txt"
+    local bistro_rep="$bistro_dir/${stem}_bismark_bt2_PE_report.txt"
+
+    if require_file "bistromark_pe/perl_bam" "$perl_bam" && require_file "bistromark_pe/bistro_bam" "$bistro_bam"; then
+        run_diff_bam_key_fields "bistromark_pe/bam" "$perl_bam" "$bistro_bam"
+    fi
+
+    if require_file "bistromark_pe/perl_report" "$perl_rep" && require_file "bistromark_pe/bistro_report" "$bistro_rep"; then
+        run_diff_bismark_report "bistromark_pe/report" "$perl_rep" "$bistro_rep"
+    fi
+
+    cleanup "$wd"
+}
+
+# ─── Test: bistromark SE alignment ───────────────────────────────────────────
+
+test_bistromark_se() {
+    echo ""
+    echo "=== bistromark SE vs Perl bismark ==="
+
+    local wd; wd=$(make_workdir)
+    local fq1="${CUSTOM_FASTQ1:-$TEST_FILES/test_R1.fastq.gz}"
+    local fq1_base; fq1_base=$(basename "$fq1")
+    local stem; stem=$(basename "$fq1_base" .gz)
+    stem="${stem%.fastq}"; stem="${stem%.fq}"
+    local genome_dir="$SHARED_GENOME_DIR"
+
+    local perl_dir="$wd/perl" bistro_dir="$wd/bistro"
+    mkdir -p "$perl_dir" "$bistro_dir"
+
+    echo "  Aligning with Perl bismark (SE)..." >&2
+    if ! (cd "$perl_dir" && perl "$PERL_BIN/bismark" \
+        --genome "$genome_dir" \
+        --single_end "$fq1" \
+        >/dev/null 2>"$wd/perl_align.err"); then
+        echo "  FAIL  bistromark_se/perl_align"
+        sed -n '1,40p' "$wd/perl_align.err" || true
+        FAIL=$(( FAIL + 1 ))
+        cleanup "$wd"
+        return
+    fi
+
+    echo "  Aligning with bistromark (SE)..." >&2
+    if ! "$RUST_BIN/bistromark" \
+        --genome "$genome_dir" \
+        -U "$fq1" \
+        --output_dir "$bistro_dir" \
+        >/dev/null 2>"$wd/bistro_align.err"; then
+        echo "  FAIL  bistromark_se/bistro_align"
+        sed -n '1,40p' "$wd/bistro_align.err" || true
+        FAIL=$(( FAIL + 1 ))
+        cleanup "$wd"
+        return
+    fi
+
+    local perl_bam="$perl_dir/${stem}_bismark_bt2.bam"
+    local bistro_bam="$bistro_dir/${stem}_bismark_bt2.bam"
+    local perl_rep="$perl_dir/${stem}_bismark_bt2_SE_report.txt"
+    local bistro_rep="$bistro_dir/${stem}_bismark_bt2_SE_report.txt"
+
+    if require_file "bistromark_se/perl_bam" "$perl_bam" && require_file "bistromark_se/bistro_bam" "$bistro_bam"; then
+        run_diff_bam_key_fields "bistromark_se/bam" "$perl_bam" "$bistro_bam"
+    fi
+
+    if require_file "bistromark_se/perl_report" "$perl_rep" && require_file "bistromark_se/bistro_report" "$bistro_rep"; then
+        run_diff_bismark_report "bistromark_se/report" "$perl_rep" "$bistro_rep"
+    fi
 
     cleanup "$wd"
 }
@@ -728,8 +922,11 @@ test_test_files_inputs() {
 check_prereq
 
 if [[ "$USE_TEST_FILES" -eq 1 ]]; then
+    prepare_shared_genome
     test_genome_preparation_test_files
     test_test_files_inputs
+    test_bistromark_pe
+    test_bistromark_se
 else
     test_genome_preparation
     test_extractor
@@ -746,5 +943,7 @@ echo ""
 echo "═══════════════════════════════════════"
 echo " Results: $PASS passed, $FAIL failed"
 echo "═══════════════════════════════════════"
+
+[[ -n "$SHARED_GENOME_DIR" ]] && rm -rf "$SHARED_GENOME_DIR"
 
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

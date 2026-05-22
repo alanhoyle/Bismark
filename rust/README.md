@@ -17,6 +17,7 @@ The main Bismark aligner is not yet ported; alignment still uses the Perl
 
 | Binary                          | Replaces                        | Purpose                                                                |
 | ------------------------------- | ------------------------------- | ---------------------------------------------------------------------- |
+| `bistromark`                    | `bismark`                       | Align bisulfite-seq reads with Bowtie2; produces BAM + XM/XR/XG tags   |
 | `bismark_methylation_extractor` | `bismark_methylation_extractor` | Extract per-cytosine methylation calls from Bismark BAM/SAM/CRAM files |
 | `deduplicate_bismark`           | `deduplicate_bismark`           | Remove PCR duplicates from Bismark alignments                          |
 | `bismark2bedGraph`              | `bismark2bedGraph`              | Convert methylation call files to bedGraph and coverage format         |
@@ -58,9 +59,14 @@ This port was written with [Claude Code](https://claude.ai/code) (Anthropic) and
 
 **Known gaps:**
 
-- The main `bismark` aligner is not ported; only downstream tools are covered.
-- Validation used paired-end Bowtie2 alignments. HISAT2, minimap2, and single-end
-  modes have lighter test coverage.
+- `bistromark` (the aligner port) is an MVP: directional, non-directional, and
+  PBAT modes are implemented for Bowtie2 SE and PE. HISAT2, minimap2, `--parallel`
+  sharding, and SLAM-seq are not yet ported (passing these flags prints a warning
+  and continues with Bowtie2 in standard bisulfite mode).
+- `bistromark` has not yet been validated against real data; differential tests
+  against the Perl `bismark` aligner are the next step.
+- Validation of the downstream tools used paired-end Bowtie2 alignments. HISAT2,
+  minimap2, and single-end modes have lighter test coverage.
 - NOMe-seq and SLAM-seq code paths have not been validated against real data.
 - `bismark2summary` sorts samples lexicographically; the Perl version emits them
   in filesystem glob order (non-deterministic). Row order in the summary report
@@ -171,6 +177,14 @@ Supply custom data the same way:
     --fastq1 R1.fastq.gz --fastq2 R2.fastq.gz
 ```
 
+If you already have a prepared Bismark genome directory, pass `--genome` to skip
+the genome-preparation benchmark and re-use it:
+
+```bash
+./tests/performance.sh --genome /path/to/prepared/genome \
+    --fastq1 R1.fastq.gz --fastq2 R2.fastq.gz
+```
+
 ## Project layout
 
 ```text
@@ -195,6 +209,32 @@ rust/
 
 The Rust tools accept the same flags as the Perl originals. The notes below
 cover flags where behaviour differs from the Perl version.
+
+### `bistromark`
+
+`bistromark` accepts all common `bismark` flags. Differences from the Perl
+`bismark` aligner:
+
+- **Deferred features** — `--hisat2`, `--minimap2`, `--parallel`/`--multicore`,
+  `--slam`, `--cram`, `--non_bs_mm`, `--nucleotide_coverage`, `--old_flag`,
+  `--ambig_bam`, and `--strandID` are accepted but emit a `WARNING:` message and
+  have no effect. This allows existing `bismark` command lines to run without
+  modification while the features are being ported.
+- **Dovetail** — PE dovetail overlap is enabled by default (matching Perl
+  `bismark`). Use `--no_dovetail` to disable it.
+- **`--local`** — switches Bowtie2 to local alignment mode and adjusts the
+  default `--score_min` to `L,0,0.5`.
+- **`--unmapped` / `--un`** — writes unmapped reads to
+  `{stem}_unmapped_reads.fq` (SE) or `{stem}_unmapped_reads_{1,2}.fq` (PE).
+- **`--ambiguous`** — writes ambiguously-mapped reads to
+  `{stem}_ambiguous_reads.fq` / `{stem}_ambiguous_reads_{1,2}.fq`.
+- **`--rg_tag`** — adds an `@RG` header line and `RG:Z:` per-record tag.
+  Defaults: `--rg_id 1`, `--rg_sample` derived from the input filename stem.
+- **`--fasta` / `-f`** — reads FASTA input; quality scores are set to `I`
+  (Phred 40) for alignment purposes.
+- **`-B` / `--basename`** — sets the full output stem, overriding the default
+  derived from the input filename.
+- **`--prefix`** — prepends `{PREFIX}_` to the auto-derived output stem.
 
 ### `deduplicate_bismark`
 

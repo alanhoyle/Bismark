@@ -700,11 +700,6 @@ fn strip_ext(filename: &str) -> &str {
         .trim_end_matches(".txt")
 }
 
-/// Prepend output_dir to the bare base name to form the output path prefix.
-fn make_stem(filename: &str, output_dir: &str) -> String {
-    format!("{}{}", output_dir, strip_ext(filename))
-}
-
 fn open_outputs(stem: &str, mode: OutputMode, gzip: bool, no_header: bool) -> Result<OutputFiles> {
     let ext = if gzip { ".txt.gz" } else { ".txt" };
     let contexts = ["CpG", "CHG", "CHH"];
@@ -1125,70 +1120,140 @@ fn process_file(
 
     eprintln!("Now reading in Bismark result file {filename}");
 
-    let groups = read_record_groups(samtools, path, is_paired)?;
-    let line_count = groups.len() as u64;
+    let mut line_count: u64 = 0;
 
-    if cli.multicore > 1 && groups.len() > 1 {
+    if cli.multicore > 1 {
+        // Chunked parallel: read CHUNK_SIZE records, dispatch across threads,
+        // merge into the output writers, drop the chunk, then read the next.
+        // Peak RAM is O(chunk × threads) rather than O(whole file).
+        const CHUNK_SIZE: usize = 500_000;
         let threads = cli.multicore as usize;
-        eprintln!("Processing {line_count} record groups with {threads} worker threads");
+        eprintln!("Processing with {threads} worker threads (chunk size: {CHUNK_SIZE})");
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .context("building Rayon thread pool")?;
-        let chunk_results: Vec<Result<ChunkResult>> = pool.install(|| {
-            (0..threads)
-                .into_par_iter()
-                .map(|worker_idx| {
-                    let mut chunk_out = open_buffer_outputs(mode)?;
-                    let mut chunk_mbias1: MbiasTable = HashMap::new();
-                    let mut chunk_mbias2: MbiasTable = HashMap::new();
-                    let mut chunk_counts = Counts::new();
-                    for group in groups.iter().skip(worker_idx).step_by(threads) {
-                        process_record_group(
-                            group,
-                            is_paired,
-                            cli,
-                            no_overlap,
-                            &mut chunk_out,
-                            &mut chunk_mbias1,
-                            &mut chunk_mbias2,
-                            &mut chunk_counts,
-                        )?;
-                    }
-                    Ok(ChunkResult {
-                        out: chunk_out,
-                        mbias1: chunk_mbias1,
-                        mbias2: chunk_mbias2,
-                        counts: chunk_counts,
-                    })
-                })
-                .collect()
-        });
 
-        for chunk_result in chunk_results {
-            let chunk_result = chunk_result?;
-            out.append_from(&chunk_result.out)?;
-            merge_mbias(&mut mbias1, &chunk_result.mbias1);
-            merge_mbias(&mut mbias2, &chunk_result.mbias2);
-            counts.merge(&chunk_result.counts);
-        }
-    } else {
-        for (idx, group) in groups.iter().enumerate() {
-            let processed = idx as u64 + 1;
-            if processed % 500_000 == 0 {
-                eprintln!("Processed {processed} lines");
+        let mut reader = BamReader::open(samtools, path, &[])?;
+        loop {
+            let chunk = read_chunk(&mut reader, is_paired, CHUNK_SIZE)?;
+            if chunk.is_empty() {
+                break;
             }
-            process_record_group(
-                group,
-                is_paired,
-                cli,
-                no_overlap,
-                &mut out,
-                &mut mbias1,
-                &mut mbias2,
-                &mut counts,
-            )?;
+            let n = chunk.len() as u64;
+            line_count += n;
+
+            let chunk_results: Vec<Result<ChunkResult>> = pool.install(|| {
+                (0..threads)
+                    .into_par_iter()
+                    .map(|worker_idx| {
+                        let mut chunk_out = open_buffer_outputs(mode)?;
+                        let mut chunk_mbias1: MbiasTable = HashMap::new();
+                        let mut chunk_mbias2: MbiasTable = HashMap::new();
+                        let mut chunk_counts = Counts::new();
+                        for group in chunk.iter().skip(worker_idx).step_by(threads) {
+                            process_record_group(
+                                &group.first,
+                                group.second.as_deref(),
+                                is_paired,
+                                cli,
+                                no_overlap,
+                                &mut chunk_out,
+                                &mut chunk_mbias1,
+                                &mut chunk_mbias2,
+                                &mut chunk_counts,
+                            )?;
+                        }
+                        Ok(ChunkResult {
+                            out: chunk_out,
+                            mbias1: chunk_mbias1,
+                            mbias2: chunk_mbias2,
+                            counts: chunk_counts,
+                        })
+                    })
+                    .collect()
+            });
+
+            for chunk_result in chunk_results {
+                let chunk_result = chunk_result?;
+                out.append_from(&chunk_result.out)?;
+                merge_mbias(&mut mbias1, &chunk_result.mbias1);
+                merge_mbias(&mut mbias2, &chunk_result.mbias2);
+                counts.merge(&chunk_result.counts);
+            }
+
+            eprintln!("Processed {line_count} lines");
         }
+        reader.finish()?;
+    } else {
+        // Single-threaded: stream one record (or pair) at a time so the whole
+        // file is never held in RAM simultaneously.
+        let mut reader = BamReader::open(samtools, path, &[])?;
+        let mut buf1 = Vec::with_capacity(8192);
+        let mut buf2 = Vec::with_capacity(8192);
+
+        'outer: loop {
+            buf1.clear();
+            loop {
+                let n = reader.lines().read_until(b'\n', &mut buf1)?;
+                if n == 0 {
+                    break 'outer;
+                }
+                while buf1.last() == Some(&b'\n') || buf1.last() == Some(&b'\r') {
+                    buf1.pop();
+                }
+                if !buf1.starts_with(b"@") && !buf1.is_empty() {
+                    break;
+                }
+                buf1.clear();
+            }
+
+            if is_paired {
+                buf2.clear();
+                loop {
+                    let n = reader.lines().read_until(b'\n', &mut buf2)?;
+                    if n == 0 {
+                        break 'outer;
+                    }
+                    while buf2.last() == Some(&b'\n') || buf2.last() == Some(&b'\r') {
+                        buf2.pop();
+                    }
+                    if !buf2.starts_with(b"@") && !buf2.is_empty() {
+                        break;
+                    }
+                    buf2.clear();
+                }
+                process_record_group(
+                    &buf1,
+                    Some(&buf2),
+                    is_paired,
+                    cli,
+                    no_overlap,
+                    &mut out,
+                    &mut mbias1,
+                    &mut mbias2,
+                    &mut counts,
+                )?;
+            } else {
+                process_record_group(
+                    &buf1,
+                    None,
+                    is_paired,
+                    cli,
+                    no_overlap,
+                    &mut out,
+                    &mut mbias1,
+                    &mut mbias2,
+                    &mut counts,
+                )?;
+            }
+
+            line_count += 1;
+            if line_count % 500_000 == 0 {
+                eprintln!("Processed {line_count} lines");
+            }
+        }
+        reader.finish()?;
     }
 
     // Write M-bias report
@@ -1208,62 +1273,57 @@ fn process_file(
     Ok(())
 }
 
-fn read_record_groups(samtools: &str, path: &Path, is_paired: bool) -> Result<Vec<RecordGroup>> {
-    let mut reader = BamReader::open(samtools, path, &[])?;
-    let mut buf = Vec::with_capacity(8192);
-    let mut groups = Vec::new();
+/// Read up to `max_records` record groups from an already-open BamReader.
+/// Returns an empty Vec when the stream is exhausted.
+fn read_chunk(reader: &mut BamReader, is_paired: bool, max_records: usize) -> Result<Vec<RecordGroup>> {
+    let mut groups = Vec::with_capacity(max_records.min(65_536));
+    let mut buf1 = Vec::with_capacity(8192);
+    let mut buf2 = Vec::with_capacity(8192);
 
-    loop {
-        buf.clear();
-        let n = reader.lines().read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            break;
-        }
-        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-            buf.pop();
-        }
-        if buf.starts_with(b"@") || buf.is_empty() {
-            continue;
+    while groups.len() < max_records {
+        buf1.clear();
+        loop {
+            let n = reader.lines().read_until(b'\n', &mut buf1)?;
+            if n == 0 {
+                return Ok(groups);
+            }
+            while buf1.last() == Some(&b'\n') || buf1.last() == Some(&b'\r') {
+                buf1.pop();
+            }
+            if !buf1.starts_with(b"@") && !buf1.is_empty() {
+                break;
+            }
+            buf1.clear();
         }
 
         if is_paired {
-            let mut r2_buf = Vec::with_capacity(8192);
+            buf2.clear();
             loop {
-                r2_buf.clear();
-                let n = reader.lines().read_until(b'\n', &mut r2_buf)?;
+                let n = reader.lines().read_until(b'\n', &mut buf2)?;
                 if n == 0 {
-                    groups.push(RecordGroup {
-                        first: buf.clone(),
-                        second: None,
-                    });
-                    reader.finish()?;
+                    groups.push(RecordGroup { first: buf1.clone(), second: None });
                     return Ok(groups);
                 }
-                while r2_buf.last() == Some(&b'\n') || r2_buf.last() == Some(&b'\r') {
-                    r2_buf.pop();
+                while buf2.last() == Some(&b'\n') || buf2.last() == Some(&b'\r') {
+                    buf2.pop();
                 }
-                if r2_buf.starts_with(b"@") || r2_buf.is_empty() {
-                    continue;
+                if !buf2.starts_with(b"@") && !buf2.is_empty() {
+                    break;
                 }
-                break;
+                buf2.clear();
             }
-            groups.push(RecordGroup {
-                first: buf.clone(),
-                second: Some(r2_buf),
-            });
+            groups.push(RecordGroup { first: buf1.clone(), second: Some(buf2.clone()) });
         } else {
-            groups.push(RecordGroup {
-                first: buf.clone(),
-                second: None,
-            });
+            groups.push(RecordGroup { first: buf1.clone(), second: None });
         }
     }
-    reader.finish()?;
+
     Ok(groups)
 }
 
 fn process_record_group(
-    group: &RecordGroup,
+    first: &[u8],
+    second: Option<&[u8]>,
     is_paired: bool,
     cli: &Cli,
     no_overlap: bool,
@@ -1272,7 +1332,7 @@ fn process_record_group(
     mbias2: &mut MbiasTable,
     counts: &mut Counts,
 ) -> Result<()> {
-    let buf = &group.first;
+    let buf = first;
 
     let fields: Vec<&[u8]> = buf.split(|&b| b == b'\t').collect();
     if fields.len() < 11 {
@@ -1323,7 +1383,7 @@ fn process_record_group(
 
     if is_paired {
         process_pair(
-            group.second.as_deref(),
+            second,
             id,
             chr,
             start,
@@ -1791,18 +1851,6 @@ mod tests {
     #[test]
     fn test_strip_ext_path_component() {
         assert_eq!(strip_ext("/data/run/sample.bam"), "sample");
-    }
-
-    // ─── make_stem ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_make_stem_prepends_output_dir() {
-        assert_eq!(make_stem("sample.bam", "/out/"), "/out/sample");
-    }
-
-    #[test]
-    fn test_make_stem_empty_dir() {
-        assert_eq!(make_stem("sample.bam", ""), "sample");
     }
 
     // ─── normalise_dir ───────────────────────────────────────────────────────

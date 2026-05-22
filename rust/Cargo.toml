@@ -12,6 +12,7 @@ members = [
     "bismark-extractor",
     "bismark-report",
     "bismark-summary",
+    "bistromark",
 ]
 resolver = "2"
 
